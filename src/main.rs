@@ -98,8 +98,10 @@ async fn main() -> anyhow::Result<()> {
         // Per-agent event bus
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
 
-        // Per-agent tool server (tools registered when agents are fully wired)
-        let tool_server = rig::tool::server::ToolServer::new().run();
+        // Per-agent tool server with memory tools pre-registered.
+        // Channel-specific tools (reply, branch, etc.) are added dynamically per
+        // conversation turn via tools::add_channel_tools().
+        let tool_server = spacebot::tools::create_channel_tool_server(memory_search.clone());
 
         let agent_id: spacebot::AgentId = Arc::from(agent_config.id.as_str());
 

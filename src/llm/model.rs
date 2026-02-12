@@ -100,31 +100,53 @@ impl CompletionModel for SpacebotModel {
         &self,
         request: CompletionRequest,
     ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        // Try the primary model
-        match self.attempt_completion(request.clone()).await {
-            Ok(response) => return Ok(response),
-            Err(error) => {
-                let error_str = error.to_string();
-                if !routing::is_retriable_error(&error_str) || self.routing.is_none() {
-                    return Err(error);
+        let Some(routing) = &self.routing else {
+            // No routing config — just call the model directly, no fallback
+            return self.attempt_completion(request).await;
+        };
+
+        let cooldown = routing.rate_limit_cooldown_secs;
+
+        // Skip the primary if it's in rate limit cooldown and we have fallbacks
+        let fallbacks = routing.get_fallbacks(&self.full_model_name);
+        let primary_rate_limited = self
+            .llm_manager
+            .is_rate_limited(&self.full_model_name, cooldown)
+            .await;
+
+        if !primary_rate_limited {
+            match self.attempt_completion(request.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    let error_str = error.to_string();
+                    if !routing::is_retriable_error(&error_str) {
+                        return Err(error);
+                    }
+                    tracing::warn!(
+                        model = %self.full_model_name,
+                        %error,
+                        "primary model failed, trying fallbacks"
+                    );
+                    self.llm_manager.record_rate_limit(&self.full_model_name).await;
                 }
-
-                tracing::warn!(
-                    model = %self.full_model_name,
-                    %error,
-                    "primary model failed, trying fallbacks"
-                );
-
-                // Record the rate limit on the manager
-                self.llm_manager.record_rate_limit(&self.full_model_name).await;
             }
+        } else {
+            tracing::debug!(
+                model = %self.full_model_name,
+                "primary model in cooldown, skipping to fallbacks"
+            );
         }
 
-        // Try fallback chain
-        let routing = self.routing.as_ref().expect("checked above");
-        let fallbacks = routing.get_fallbacks(&self.full_model_name);
-
+        // Try fallback chain, skipping models in cooldown
         for (index, fallback_name) in fallbacks.iter().take(MAX_FALLBACK_ATTEMPTS).enumerate() {
+            if self.llm_manager.is_rate_limited(fallback_name, cooldown).await {
+                tracing::debug!(
+                    fallback = %fallback_name,
+                    "fallback model in cooldown, skipping"
+                );
+                continue;
+            }
+
             let fallback = SpacebotModel::make(&self.llm_manager, fallback_name);
 
             match fallback.attempt_completion(request.clone()).await {
