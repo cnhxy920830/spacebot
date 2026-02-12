@@ -228,6 +228,65 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("messaging adapters started");
 
+    // Initialize heartbeat schedulers for each agent
+    let mut heartbeat_schedulers = Vec::new();
+    for (agent_id, agent) in &agents {
+        let store = Arc::new(spacebot::heartbeat::HeartbeatStore::new(agent.db.sqlite.clone()));
+
+        // Seed heartbeats from config into the database
+        for heartbeat_def in &agent.config.heartbeats {
+            let hb_config = spacebot::heartbeat::HeartbeatConfig {
+                id: heartbeat_def.id.clone(),
+                prompt: heartbeat_def.prompt.clone(),
+                interval_secs: heartbeat_def.interval_secs,
+                delivery_target: heartbeat_def.delivery_target.clone(),
+                active_hours: heartbeat_def.active_hours,
+                enabled: heartbeat_def.enabled,
+            };
+            if let Err(error) = store.save(&hb_config).await {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    heartbeat_id = %heartbeat_def.id,
+                    %error,
+                    "failed to seed heartbeat config"
+                );
+            }
+        }
+
+        // Load all enabled heartbeats and start the scheduler
+        let heartbeat_context = spacebot::heartbeat::HeartbeatContext {
+            deps: agent.deps.clone(),
+            system_prompt: agent.prompts.channel.clone(),
+            identity_context: agent.identity.render(),
+            branch_system_prompt: agent.prompts.branch.clone(),
+            worker_system_prompt: agent.prompts.worker.clone(),
+            compactor_prompt: agent.prompts.compactor.clone(),
+            browser_config: agent.config.browser.clone(),
+            screenshot_dir: agent.config.screenshot_dir(),
+            skills: agent.skills.clone(),
+            messaging_manager: messaging_manager.clone(),
+            store: store.clone(),
+        };
+
+        let scheduler = spacebot::heartbeat::Scheduler::new(heartbeat_context);
+
+        match store.load_all().await {
+            Ok(configs) => {
+                for hb_config in configs {
+                    if let Err(error) = scheduler.register(hb_config).await {
+                        tracing::warn!(agent_id = %agent_id, %error, "failed to register heartbeat");
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(agent_id = %agent_id, %error, "failed to load heartbeats from database");
+            }
+        }
+
+        heartbeat_schedulers.push(scheduler);
+        tracing::info!(agent_id = %agent_id, "heartbeat scheduler started");
+    }
+
     let default_agent_id = config.default_agent_id().to_string();
     let bindings = config.bindings.clone();
 
@@ -389,6 +448,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Graceful shutdown
     drop(active_channels);
+
+    for scheduler in &heartbeat_schedulers {
+        scheduler.shutdown().await;
+    }
+    drop(heartbeat_schedulers);
+
     messaging_manager.shutdown().await;
 
     for (agent_id, agent) in agents {

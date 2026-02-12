@@ -1,33 +1,71 @@
-//! Heartbeat scheduler for timer-based tasks.
+//! Heartbeat scheduler: timer management and execution.
+//!
+//! Each heartbeat gets its own tokio task that fires on an interval.
+//! When a heartbeat fires, it creates a fresh short-lived channel,
+//! runs the heartbeat prompt through the LLM, and delivers the result
+//! to the delivery target via the messaging system.
 
+use crate::agent::channel::{Channel, ChannelConfig};
+use crate::config::BrowserConfig;
 use crate::error::Result;
-use crate::{ProcessEvent, ChannelId, AgentDeps};
+use crate::heartbeat::store::HeartbeatStore;
+use crate::messaging::MessagingManager;
+use crate::{AgentDeps, InboundMessage, MessageContent, OutboundResponse};
+use chrono::Timelike;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
-use tokio::time::{interval, Duration, Interval};
-use chrono::Timelike;
+use tokio::sync::RwLock;
+use tokio::time::{interval, Duration};
 
-/// A heartbeat is a scheduled task that fires at intervals.
+/// A heartbeat definition loaded from the database.
 #[derive(Debug, Clone)]
 pub struct Heartbeat {
     pub id: String,
     pub prompt: String,
     pub interval_secs: u64,
-    pub delivery_target: String,
-    pub active_hours: Option<(u8, u8)>, // (start_hour, end_hour) in 24h format
+    pub delivery_target: DeliveryTarget,
+    pub active_hours: Option<(u8, u8)>,
     pub enabled: bool,
     pub consecutive_failures: u32,
-    pub last_run: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Heartbeat configuration for storage.
+/// Where to send heartbeat results.
+#[derive(Debug, Clone)]
+pub struct DeliveryTarget {
+    /// Messaging adapter name (e.g. "discord").
+    pub adapter: String,
+    /// Platform-specific target (e.g. a Discord channel ID).
+    pub target: String,
+}
+
+impl DeliveryTarget {
+    /// Parse a delivery target string in the format "adapter:target".
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (adapter, target) = raw.split_once(':')?;
+        if adapter.is_empty() || target.is_empty() {
+            return None;
+        }
+        Some(Self {
+            adapter: adapter.to_string(),
+            target: target.to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for DeliveryTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.adapter, self.target)
+    }
+}
+
+/// Serializable heartbeat config (for storage and TOML parsing).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HeartbeatConfig {
     pub id: String,
     pub prompt: String,
     #[serde(default = "default_interval")]
     pub interval_secs: u64,
+    /// Delivery target in "adapter:target" format (e.g. "discord:123456789").
     pub delivery_target: String,
     pub active_hours: Option<(u8, u8)>,
     #[serde(default = "default_true")]
@@ -35,160 +73,200 @@ pub struct HeartbeatConfig {
 }
 
 fn default_interval() -> u64 {
-    3600 // 1 hour default
+    3600
 }
 
 fn default_true() -> bool {
     true
 }
 
-/// Scheduler that manages heartbeat timers.
+/// Context needed to execute a heartbeat (agent resources + messaging).
+#[derive(Clone)]
+pub struct HeartbeatContext {
+    pub deps: AgentDeps,
+    pub system_prompt: String,
+    pub identity_context: String,
+    pub branch_system_prompt: String,
+    pub worker_system_prompt: String,
+    pub compactor_prompt: String,
+    pub browser_config: BrowserConfig,
+    pub screenshot_dir: std::path::PathBuf,
+    pub skills: Arc<crate::skills::SkillSet>,
+    pub messaging_manager: Arc<MessagingManager>,
+    pub store: Arc<HeartbeatStore>,
+}
+
+const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+/// Scheduler that manages heartbeat timers and execution.
 pub struct Scheduler {
     heartbeats: Arc<RwLock<HashMap<String, Heartbeat>>>,
     timers: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
-    deps: AgentDeps,
-    event_tx: mpsc::Sender<HeartbeatEvent>,
-}
-
-/// Events from the scheduler.
-#[derive(Debug, Clone)]
-pub enum HeartbeatEvent {
-    /// A heartbeat fired and needs to be executed.
-    Fired { heartbeat_id: String },
-    /// A heartbeat was disabled due to failures.
-    CircuitBroken { heartbeat_id: String },
+    context: HeartbeatContext,
 }
 
 impl Scheduler {
-    /// Create a new heartbeat scheduler.
-    pub fn new(deps: AgentDeps) -> (Self, mpsc::Receiver<HeartbeatEvent>) {
-        let (event_tx, event_rx) = mpsc::channel(64);
-        
-        let scheduler = Self {
+    pub fn new(context: HeartbeatContext) -> Self {
+        Self {
             heartbeats: Arc::new(RwLock::new(HashMap::new())),
             timers: Arc::new(RwLock::new(HashMap::new())),
-            deps,
-            event_tx,
-        };
-        
-        (scheduler, event_rx)
+            context,
+        }
     }
-    
-    /// Register a new heartbeat.
+
+    /// Register and start a heartbeat from config.
     pub async fn register(&self, config: HeartbeatConfig) -> Result<()> {
+        let delivery_target = DeliveryTarget::parse(&config.delivery_target).unwrap_or_else(|| {
+            tracing::warn!(
+                heartbeat_id = %config.id,
+                raw_target = %config.delivery_target,
+                "invalid delivery target format, expected 'adapter:target'"
+            );
+            DeliveryTarget {
+                adapter: "unknown".into(),
+                target: config.delivery_target.clone(),
+            }
+        });
+
         let heartbeat = Heartbeat {
             id: config.id.clone(),
             prompt: config.prompt,
             interval_secs: config.interval_secs,
-            delivery_target: config.delivery_target,
+            delivery_target,
             active_hours: config.active_hours,
             enabled: config.enabled,
             consecutive_failures: 0,
-            last_run: None,
         };
-        
+
         {
             let mut heartbeats = self.heartbeats.write().await;
             heartbeats.insert(config.id.clone(), heartbeat);
         }
-        
-        // Start the timer if enabled
+
         if config.enabled {
-            self.start_timer(&config.id, config.interval_secs).await?;
+            self.start_timer(&config.id).await;
         }
-        
-        tracing::info!(heartbeat_id = %config.id, "heartbeat registered");
-        
+
+        tracing::info!(heartbeat_id = %config.id, interval_secs = config.interval_secs, "heartbeat registered");
         Ok(())
     }
-    
-    /// Start a timer for a heartbeat.
-    async fn start_timer(&self, heartbeat_id: &str, interval_secs: u64) -> Result<()> {
-        let heartbeat_id_owned = heartbeat_id.to_string();
-        let event_tx = self.event_tx.clone();
+
+    /// Start a timer loop for a heartbeat.
+    async fn start_timer(&self, heartbeat_id: &str) {
+        let heartbeat_id_for_map = heartbeat_id.to_string();
+        let heartbeat_id = heartbeat_id.to_string();
         let heartbeats = self.heartbeats.clone();
-        
+        let context = self.context.clone();
+
         let handle = tokio::spawn(async move {
+            // Look up interval before entering the loop
+            let interval_secs = {
+                let hb = heartbeats.read().await;
+                hb.get(&heartbeat_id)
+                    .map(|h| h.interval_secs)
+                    .unwrap_or(3600)
+            };
+
             let mut ticker = interval(Duration::from_secs(interval_secs));
-            
+            // Skip the immediate first tick — heartbeats should wait for the first interval
+            ticker.tick().await;
+
             loop {
                 ticker.tick().await;
-                
-                // Check if still enabled
-                let should_fire = {
-                    let heartbeats = heartbeats.read().await;
-                    if let Some(hb) = heartbeats.get(&heartbeat_id_owned) {
-                        if !hb.enabled {
+
+                let heartbeat = {
+                    let hb = heartbeats.read().await;
+                    match hb.get(&heartbeat_id) {
+                        Some(h) if !h.enabled => {
+                            tracing::debug!(heartbeat_id = %heartbeat_id, "heartbeat disabled, stopping timer");
                             break;
                         }
-                        
-                        // Check active hours
-                        if let Some((start, end)) = hb.active_hours {
-                            let current_hour = chrono::Local::now().hour() as u8;
-                            if current_hour < start || current_hour > end {
-                                continue; // Skip this tick
-                            }
+                        Some(h) => h.clone(),
+                        None => {
+                            tracing::debug!(heartbeat_id = %heartbeat_id, "heartbeat removed, stopping timer");
+                            break;
                         }
-                        
-                        true
-                    } else {
-                        break; // Heartbeat removed
                     }
                 };
-                
-                if should_fire {
-                    let _ = event_tx.send(HeartbeatEvent::Fired {
-                        heartbeat_id: heartbeat_id_owned.clone(),
-                    }).await;
+
+                // Check active hours window
+                if let Some((start, end)) = heartbeat.active_hours {
+                    let current_hour = chrono::Local::now().hour() as u8;
+                    let in_window = if start <= end {
+                        current_hour >= start && current_hour < end
+                    } else {
+                        // Wraps midnight (e.g. 22:00 - 06:00)
+                        current_hour >= start || current_hour < end
+                    };
+                    if !in_window {
+                        tracing::debug!(
+                            heartbeat_id = %heartbeat_id,
+                            current_hour,
+                            start,
+                            end,
+                            "outside active hours, skipping"
+                        );
+                        continue;
+                    }
+                }
+
+                tracing::info!(heartbeat_id = %heartbeat_id, "heartbeat firing");
+
+                match run_heartbeat(&heartbeat, &context).await {
+                    Ok(()) => {
+                        // Reset failure count on success
+                        let mut hb = heartbeats.write().await;
+                        if let Some(h) = hb.get_mut(&heartbeat_id) {
+                            h.consecutive_failures = 0;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            heartbeat_id = %heartbeat_id,
+                            %error,
+                            "heartbeat execution failed"
+                        );
+
+                        let should_disable = {
+                            let mut hb = heartbeats.write().await;
+                            if let Some(h) = hb.get_mut(&heartbeat_id) {
+                                h.consecutive_failures += 1;
+                                h.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+                            } else {
+                                false
+                            }
+                        };
+
+                        if should_disable {
+                            tracing::warn!(
+                                heartbeat_id = %heartbeat_id,
+                                "circuit breaker tripped after {MAX_CONSECUTIVE_FAILURES} consecutive failures, disabling"
+                            );
+
+                            {
+                                let mut hb = heartbeats.write().await;
+                                if let Some(h) = hb.get_mut(&heartbeat_id) {
+                                    h.enabled = false;
+                                }
+                            }
+
+                            // Persist the disabled state
+                            if let Err(error) = context.store.update_enabled(&heartbeat_id, false).await {
+                                tracing::error!(%error, "failed to persist heartbeat disabled state");
+                            }
+
+                            break;
+                        }
+                    }
                 }
             }
         });
-        
-        {
-            let mut timers = self.timers.write().await;
-            timers.insert(heartbeat_id.to_string(), handle);
-        }
-        
-        Ok(())
+
+        let mut timers = self.timers.write().await;
+        timers.insert(heartbeat_id_for_map, handle);
     }
-    
-    /// Get a heartbeat by ID.
-    pub async fn get(&self, id: &str) -> Option<Heartbeat> {
-        let heartbeats = self.heartbeats.read().await;
-        heartbeats.get(id).cloned()
-    }
-    
-    /// Disable a heartbeat (circuit breaker after failures).
-    pub async fn disable(&self, id: &str) -> Result<()> {
-        let mut heartbeats = self.heartbeats.write().await;
-        if let Some(hb) = heartbeats.get_mut(id) {
-            hb.enabled = false;
-            tracing::warn!(heartbeat_id = %id, "heartbeat disabled (circuit broken)");
-        }
-        Ok(())
-    }
-    
-    /// Record a failure for circuit breaker logic.
-    pub async fn record_failure(&self, id: &str) -> Result<()> {
-        const MAX_FAILURES: u32 = 3;
-        
-        let mut heartbeats = self.heartbeats.write().await;
-        if let Some(hb) = heartbeats.get_mut(id) {
-            hb.consecutive_failures += 1;
-            
-            if hb.consecutive_failures >= MAX_FAILURES {
-                hb.enabled = false;
-                drop(heartbeats);
-                let _ = self.event_tx.send(HeartbeatEvent::CircuitBroken {
-                    heartbeat_id: id.to_string(),
-                }).await;
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// Shutdown all timers.
+
+    /// Shutdown all heartbeat timers.
     pub async fn shutdown(&self) {
         let mut timers = self.timers.write().await;
         for (id, handle) in timers.drain() {
@@ -198,25 +276,139 @@ impl Scheduler {
     }
 }
 
-/// Run a heartbeat when it fires.
-pub async fn run_heartbeat(
-    heartbeat: &Heartbeat,
-    deps: AgentDeps,
-) -> Result<()> {
-    tracing::info!(heartbeat_id = %heartbeat.id, "running heartbeat");
-    
-    // In real implementation:
-    // 1. Create a fresh short-lived channel
-    // 2. Give it the heartbeat prompt
-    // 3. Run it like a normal channel (with branching, workers, etc.)
-    // 4. Deliver result to the target if there's anything to report
-    
-    // For now, just log
-    tracing::info!(
-        heartbeat_id = %heartbeat.id,
-        prompt = %heartbeat.prompt,
-        "heartbeat executed"
+/// Execute a single heartbeat: create a fresh channel, run the prompt, deliver the result.
+async fn run_heartbeat(heartbeat: &Heartbeat, context: &HeartbeatContext) -> Result<()> {
+    let channel_id: crate::ChannelId = Arc::from(format!("heartbeat:{}", heartbeat.id).as_str());
+
+    // Create the outbound response channel to collect whatever the channel produces
+    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<OutboundResponse>(32);
+
+    // Subscribe to the agent's event bus (the channel needs this for branch/worker events)
+    let event_rx = context.deps.event_tx.subscribe();
+
+    let (channel, channel_tx) = Channel::new(
+        channel_id.clone(),
+        context.deps.clone(),
+        ChannelConfig::default(),
+        &context.system_prompt,
+        &context.identity_context,
+        &context.branch_system_prompt,
+        &context.worker_system_prompt,
+        &context.compactor_prompt,
+        response_tx,
+        event_rx,
+        context.browser_config.clone(),
+        context.screenshot_dir.clone(),
+        context.skills.clone(),
     );
-    
+
+    // Spawn the channel's event loop
+    let channel_handle = tokio::spawn(async move {
+        if let Err(error) = channel.run().await {
+            tracing::error!(%error, "heartbeat channel failed");
+        }
+    });
+
+    // Send the heartbeat prompt as a synthetic message
+    let message = InboundMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        source: "heartbeat".into(),
+        conversation_id: format!("heartbeat:{}", heartbeat.id),
+        sender_id: "system".into(),
+        agent_id: Some(context.deps.agent_id.clone()),
+        content: MessageContent::Text(heartbeat.prompt.clone()),
+        timestamp: chrono::Utc::now(),
+        metadata: HashMap::new(),
+    };
+
+    channel_tx
+        .send(message)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to send heartbeat prompt to channel: {error}"))?;
+
+    // Collect responses with a timeout. The channel may produce multiple messages
+    // (e.g. status updates, then text). We only care about text responses.
+    let mut collected_text = Vec::new();
+    let timeout = Duration::from_secs(120);
+
+    // Drop the sender so the channel knows no more messages are coming.
+    // The channel will process the one message and then its event loop will end
+    // when the sender is dropped (message_rx returns None).
+    drop(channel_tx);
+
+    loop {
+        match tokio::time::timeout(timeout, response_rx.recv()).await {
+            Ok(Some(OutboundResponse::Text(text))) => {
+                collected_text.push(text);
+            }
+            Ok(Some(_)) => {
+                // Status updates, stream chunks, etc. — ignore for heartbeats
+            }
+            Ok(None) => {
+                // Channel finished (response_tx dropped)
+                break;
+            }
+            Err(_) => {
+                tracing::warn!(heartbeat_id = %heartbeat.id, "heartbeat timed out after {timeout:?}");
+                channel_handle.abort();
+                break;
+            }
+        }
+    }
+
+    // Wait for the channel task to finish (it should already be done since we dropped channel_tx)
+    let _ = channel_handle.await;
+
+    let result_text = collected_text.join("\n\n");
+    let has_result = !result_text.trim().is_empty();
+
+    // Log execution
+    let summary = if has_result {
+        Some(result_text.as_str())
+    } else {
+        None
+    };
+    if let Err(error) = context
+        .store
+        .log_execution(&heartbeat.id, true, summary)
+        .await
+    {
+        tracing::warn!(%error, "failed to log heartbeat execution");
+    }
+
+    // Deliver result to target (only if there's something to say)
+    if has_result {
+        if let Err(error) = context
+            .messaging_manager
+            .broadcast(
+                &heartbeat.delivery_target.adapter,
+                &heartbeat.delivery_target.target,
+                OutboundResponse::Text(result_text),
+            )
+            .await
+        {
+            tracing::error!(
+                heartbeat_id = %heartbeat.id,
+                target = %heartbeat.delivery_target,
+                %error,
+                "failed to deliver heartbeat result"
+            );
+            // Log the delivery failure
+            let _ = context
+                .store
+                .log_execution(&heartbeat.id, false, Some(&error.to_string()))
+                .await;
+            return Err(error);
+        }
+
+        tracing::info!(
+            heartbeat_id = %heartbeat.id,
+            target = %heartbeat.delivery_target,
+            "heartbeat result delivered"
+        );
+    } else {
+        tracing::debug!(heartbeat_id = %heartbeat.id, "heartbeat produced no output, skipping delivery");
+    }
+
     Ok(())
 }

@@ -94,6 +94,44 @@ impl HeartbeatStore {
         
         Ok(())
     }
+
+    /// Update the enabled state of a heartbeat (used by circuit breaker).
+    pub async fn update_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        sqlx::query("UPDATE heartbeats SET enabled = ? WHERE id = ?")
+            .bind(enabled as i64)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("failed to update heartbeat enabled state")?;
+
+        Ok(())
+    }
+
+    /// Log a heartbeat execution result.
+    pub async fn log_execution(
+        &self,
+        heartbeat_id: &str,
+        success: bool,
+        result_summary: Option<&str>,
+    ) -> Result<()> {
+        let execution_id = uuid::Uuid::new_v4().to_string();
+
+        sqlx::query(
+            r#"
+            INSERT INTO heartbeat_executions (id, heartbeat_id, success, result_summary)
+            VALUES (?, ?, ?, ?)
+            "#,
+        )
+        .bind(&execution_id)
+        .bind(heartbeat_id)
+        .bind(success as i64)
+        .bind(result_summary)
+        .execute(&self.pool)
+        .await
+        .context("failed to log heartbeat execution")?;
+
+        Ok(())
+    }
 }
 
 use sqlx::Row as _;

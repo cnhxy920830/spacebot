@@ -141,6 +141,21 @@ pub struct AgentConfig {
     pub compaction: Option<CompactionConfig>,
     pub cortex: Option<CortexConfig>,
     pub browser: Option<BrowserConfig>,
+    /// Heartbeat definitions for this agent.
+    pub heartbeats: Vec<HeartbeatDef>,
+}
+
+/// A heartbeat definition from config.
+#[derive(Debug, Clone)]
+pub struct HeartbeatDef {
+    pub id: String,
+    pub prompt: String,
+    pub interval_secs: u64,
+    /// Delivery target in "adapter:target" format (e.g. "discord:123456789").
+    pub delivery_target: String,
+    /// Optional active hours window (start_hour, end_hour) in 24h format.
+    pub active_hours: Option<(u8, u8)>,
+    pub enabled: bool,
 }
 
 /// Fully resolved agent config (merged with defaults, paths resolved).
@@ -158,6 +173,7 @@ pub struct ResolvedAgentConfig {
     pub cortex: CortexConfig,
     pub browser: BrowserConfig,
     pub history_backfill_count: usize,
+    pub heartbeats: Vec<HeartbeatDef>,
 }
 
 impl AgentConfig {
@@ -189,6 +205,7 @@ impl AgentConfig {
                 .clone()
                 .unwrap_or_else(|| defaults.browser.clone()),
             history_backfill_count: defaults.history_backfill_count,
+            heartbeats: self.heartbeats.clone(),
         }
     }
 }
@@ -408,6 +425,24 @@ struct TomlAgentConfig {
     max_concurrent_branches: Option<usize>,
     max_turns: Option<usize>,
     context_window: Option<usize>,
+    #[serde(default)]
+    heartbeats: Vec<TomlHeartbeatDef>,
+}
+
+#[derive(Deserialize)]
+struct TomlHeartbeatDef {
+    id: String,
+    prompt: String,
+    interval_secs: Option<u64>,
+    delivery_target: String,
+    active_start_hour: Option<u8>,
+    active_end_hour: Option<u8>,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 #[derive(Deserialize, Default)]
@@ -555,6 +590,7 @@ impl Config {
             compaction: None,
             cortex: None,
             browser: None,
+            heartbeats: Vec::new(),
         }];
 
         Ok(Self {
@@ -670,6 +706,22 @@ impl Config {
                     .routing
                     .map(|r| resolve_routing(Some(r), &defaults.routing));
 
+                let heartbeats = a
+                    .heartbeats
+                    .into_iter()
+                    .map(|h| HeartbeatDef {
+                        id: h.id,
+                        prompt: h.prompt,
+                        interval_secs: h.interval_secs.unwrap_or(3600),
+                        delivery_target: h.delivery_target,
+                        active_hours: match (h.active_start_hour, h.active_end_hour) {
+                            (Some(s), Some(e)) => Some((s, e)),
+                            _ => None,
+                        },
+                        enabled: h.enabled,
+                    })
+                    .collect();
+
                 AgentConfig {
                     id: a.id,
                     default: a.default,
@@ -681,6 +733,7 @@ impl Config {
                     compaction: None,
                     cortex: None,
                     browser: None,
+                    heartbeats,
                 }
             })
             .collect();
@@ -697,6 +750,7 @@ impl Config {
                 compaction: None,
                 cortex: None,
                 browser: None,
+                heartbeats: Vec::new(),
             });
         }
 
