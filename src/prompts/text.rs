@@ -100,6 +100,11 @@ fn lookup(lang: &str, key: &str) -> &'static str {
             include_str!("../../prompts/en/fragments/system/ingestion_chunk.md.j2")
         }
 
+        // Coalesce Hint
+        ("en", "fragments/coalesce_hint") => {
+            include_str!("../../prompts/en/fragments/coalesce_hint.md.j2")
+        }
+
         // Tool Descriptions
         ("en", "tools/reply") => include_str!("../../prompts/en/tools/reply_description.md.j2"),
         ("en", "tools/branch") => include_str!("../../prompts/en/tools/branch_description.md.j2"),

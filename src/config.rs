@@ -67,6 +67,7 @@ pub struct DefaultsConfig {
     pub context_window: usize,
     pub compaction: CompactionConfig,
     pub memory_persistence: MemoryPersistenceConfig,
+    pub coalesce: CoalesceConfig,
     pub ingestion: IngestionConfig,
     pub cortex: CortexConfig,
     pub browser: BrowserConfig,
@@ -115,6 +116,37 @@ impl Default for CompactionConfig {
             background_threshold: 0.80,
             aggressive_threshold: 0.85,
             emergency_threshold: 0.95,
+        }
+    }
+}
+
+/// Message coalescing configuration for handling rapid-fire messages.
+///
+/// When enabled, messages arriving in quick succession are accumulated and
+/// presented to the LLM as a single batched turn with a hint that this is
+/// a fast-moving conversation.
+#[derive(Debug, Clone, Copy)]
+pub struct CoalesceConfig {
+    /// Enable message coalescing for multi-user channels.
+    pub enabled: bool,
+    /// Initial debounce window after first message (milliseconds).
+    pub debounce_ms: u64,
+    /// Maximum time to wait before flushing regardless (milliseconds).
+    pub max_wait_ms: u64,
+    /// Min messages to trigger coalesce mode (1 = always debounce, 2 = only when burst detected).
+    pub min_messages: usize,
+    /// Apply only to multi-user conversations (skip for DMs).
+    pub multi_user_only: bool,
+}
+
+impl Default for CoalesceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            debounce_ms: 1500,
+            max_wait_ms: 5000,
+            min_messages: 2,
+            multi_user_only: true,
         }
     }
 }
@@ -247,6 +279,7 @@ pub struct AgentConfig {
     pub context_window: Option<usize>,
     pub compaction: Option<CompactionConfig>,
     pub memory_persistence: Option<MemoryPersistenceConfig>,
+    pub coalesce: Option<CoalesceConfig>,
     pub ingestion: Option<IngestionConfig>,
     pub cortex: Option<CortexConfig>,
     pub browser: Option<BrowserConfig>,
@@ -283,6 +316,7 @@ pub struct ResolvedAgentConfig {
     pub context_window: usize,
     pub compaction: CompactionConfig,
     pub memory_persistence: MemoryPersistenceConfig,
+    pub coalesce: CoalesceConfig,
     pub ingestion: IngestionConfig,
     pub cortex: CortexConfig,
     pub browser: BrowserConfig,
@@ -302,6 +336,7 @@ impl Default for DefaultsConfig {
             context_window: 128_000,
             compaction: CompactionConfig::default(),
             memory_persistence: MemoryPersistenceConfig::default(),
+            coalesce: CoalesceConfig::default(),
             ingestion: IngestionConfig::default(),
             cortex: CortexConfig::default(),
             browser: BrowserConfig::default(),
@@ -341,6 +376,7 @@ impl AgentConfig {
             memory_persistence: self
                 .memory_persistence
                 .unwrap_or(defaults.memory_persistence),
+            coalesce: self.coalesce.unwrap_or(defaults.coalesce),
             ingestion: self.ingestion.unwrap_or(defaults.ingestion),
             cortex: self.cortex.unwrap_or(defaults.cortex),
             browser: self
@@ -733,6 +769,7 @@ struct TomlDefaultsConfig {
     context_window: Option<usize>,
     compaction: Option<TomlCompactionConfig>,
     memory_persistence: Option<TomlMemoryPersistenceConfig>,
+    coalesce: Option<TomlCoalesceConfig>,
     ingestion: Option<TomlIngestionConfig>,
     cortex: Option<TomlCortexConfig>,
     browser: Option<TomlBrowserConfig>,
@@ -759,6 +796,15 @@ struct TomlRoutingConfig {
 struct TomlMemoryPersistenceConfig {
     enabled: Option<bool>,
     message_interval: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct TomlCoalesceConfig {
+    enabled: Option<bool>,
+    debounce_ms: Option<u64>,
+    max_wait_ms: Option<u64>,
+    min_messages: Option<usize>,
+    multi_user_only: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1021,6 +1067,7 @@ impl Config {
             context_window: None,
             compaction: None,
             memory_persistence: None,
+            coalesce: None,
             ingestion: None,
             cortex: None,
             browser: None,
@@ -1111,6 +1158,21 @@ impl Config {
                         .unwrap_or(base_defaults.memory_persistence.message_interval),
                 })
                 .unwrap_or(base_defaults.memory_persistence),
+            coalesce: toml
+                .defaults
+                .coalesce
+                .map(|c| CoalesceConfig {
+                    enabled: c.enabled.unwrap_or(base_defaults.coalesce.enabled),
+                    debounce_ms: c.debounce_ms.unwrap_or(base_defaults.coalesce.debounce_ms),
+                    max_wait_ms: c.max_wait_ms.unwrap_or(base_defaults.coalesce.max_wait_ms),
+                    min_messages: c
+                        .min_messages
+                        .unwrap_or(base_defaults.coalesce.min_messages),
+                    multi_user_only: c
+                        .multi_user_only
+                        .unwrap_or(base_defaults.coalesce.multi_user_only),
+                })
+                .unwrap_or(base_defaults.coalesce),
             ingestion: toml
                 .defaults
                 .ingestion
@@ -1249,6 +1311,7 @@ impl Config {
                     context_window: a.context_window,
                     compaction: None,
                     memory_persistence: None,
+                    coalesce: None,
                     ingestion: None,
                     cortex: None,
                     browser: None,
@@ -1270,6 +1333,7 @@ impl Config {
                 context_window: None,
                 compaction: None,
                 memory_persistence: None,
+                coalesce: None,
                 ingestion: None,
                 cortex: None,
                 browser: None,
@@ -1389,6 +1453,7 @@ pub struct RuntimeConfig {
     pub routing: ArcSwap<RoutingConfig>,
     pub compaction: ArcSwap<CompactionConfig>,
     pub memory_persistence: ArcSwap<MemoryPersistenceConfig>,
+    pub coalesce: ArcSwap<CoalesceConfig>,
     pub ingestion: ArcSwap<IngestionConfig>,
     pub max_turns: ArcSwap<usize>,
     pub branch_max_turns: ArcSwap<usize>,
@@ -1437,6 +1502,7 @@ impl RuntimeConfig {
             routing: ArcSwap::from_pointee(agent_config.routing.clone()),
             compaction: ArcSwap::from_pointee(agent_config.compaction),
             memory_persistence: ArcSwap::from_pointee(agent_config.memory_persistence),
+            coalesce: ArcSwap::from_pointee(agent_config.coalesce),
             ingestion: ArcSwap::from_pointee(agent_config.ingestion),
             max_turns: ArcSwap::from_pointee(agent_config.max_turns),
             branch_max_turns: ArcSwap::from_pointee(agent_config.branch_max_turns),
@@ -1490,6 +1556,7 @@ impl RuntimeConfig {
         self.compaction.store(Arc::new(resolved.compaction));
         self.memory_persistence
             .store(Arc::new(resolved.memory_persistence));
+        self.coalesce.store(Arc::new(resolved.coalesce));
         self.ingestion.store(Arc::new(resolved.ingestion));
         self.max_turns.store(Arc::new(resolved.max_turns));
         self.branch_max_turns

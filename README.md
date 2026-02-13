@@ -53,6 +53,8 @@ This is why the architecture exists. A single-threaded agent breaks the moment t
 
 **For communities** — drop Spacebot into a Discord server. It handles concurrent conversations across channels and threads, remembers context about every member, and does real work (code, research, file operations) without going dark. Fifty people can interact with it simultaneously.
 
+**For fast-moving channels** — when messages are flying in, Spacebot doesn't try to respond to every single one. A message coalescing system detects rapid-fire bursts, batches them into a single turn, and lets the LLM read the room — it picks the most interesting thing to engage with, or stays quiet if there's nothing to add. Configurable debounce timing, automatic DM bypass, and the LLM always knows which messages arrived together.
+
 **For teams** — connect it to Slack. Each channel gets a dedicated conversation with shared memory. Spacebot can run long coding sessions for one engineer while answering quick questions from another. Workers handle the heavy lifting in the background while the channel stays responsive.
 
 **For multi-agent setups** — run multiple agents on one instance. A community bot with a friendly personality on Discord, a no-nonsense dev assistant on Slack, and a research agent handling background tasks. Each with its own identity, memory, and security permissions. One binary, one deploy.
@@ -84,6 +86,7 @@ Workers come loaded with tools for real work:
 
 Native adapters for Discord and Slack with full platform feature support:
 
+- **Message coalescing** — rapid-fire messages are batched into a single LLM turn with timing context, so the agent reads the room instead of spamming replies
 - **Streaming responses** — text appears word-by-word via message edits, not as a wall of text after 30 seconds
 - **File attachments** — send and receive files, images, and documents
 - **Threading** — automatic thread creation for long conversations

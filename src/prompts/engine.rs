@@ -97,6 +97,10 @@ impl PromptEngine {
             "fragments/system/ingestion_chunk",
             crate::prompts::text::get("fragments/system/ingestion_chunk"),
         )?;
+        env.add_template(
+            "fragments/coalesce_hint",
+            crate::prompts::text::get("fragments/coalesce_hint"),
+        )?;
 
         Ok(Self {
             env: Arc::new(env),
@@ -288,6 +292,23 @@ impl PromptEngine {
         )
     }
 
+    /// Render the coalesce hint fragment for batched messages.
+    pub fn render_coalesce_hint(
+        &self,
+        message_count: usize,
+        elapsed: &str,
+        unique_senders: usize,
+    ) -> Result<String> {
+        self.render(
+            "fragments/coalesce_hint",
+            context! {
+                message_count => message_count,
+                elapsed => elapsed,
+                unique_senders => unique_senders,
+            },
+        )
+    }
+
     /// Render the complete channel system prompt with all dynamic components.
     pub fn render_channel_prompt(
         &self,
@@ -297,6 +318,7 @@ impl PromptEngine {
         worker_capabilities: String,
         conversation_context: Option<String>,
         status_text: Option<String>,
+        coalesce_hint: Option<String>,
     ) -> Result<String> {
         self.render(
             "channel",
@@ -307,6 +329,7 @@ impl PromptEngine {
                 worker_capabilities => worker_capabilities,
                 conversation_context => conversation_context,
                 status_text => status_text,
+                coalesce_hint => coalesce_hint,
             },
         )
     }

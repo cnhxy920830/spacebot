@@ -77,6 +77,10 @@ pub struct Channel {
     message_count: usize,
     /// Branch IDs for silent memory persistence branches (results not injected into history).
     memory_persistence_branches: HashSet<BranchId>,
+    /// Buffer for coalescing rapid-fire messages.
+    coalesce_buffer: Vec<InboundMessage>,
+    /// Deadline for flushing the coalesce buffer.
+    coalesce_deadline: Option<tokio::time::Instant>,
 }
 
 impl Channel {
@@ -147,6 +151,8 @@ impl Channel {
             compactor,
             message_count: 0,
             memory_persistence_branches: HashSet::new(),
+            coalesce_buffer: Vec::new(),
+            coalesce_deadline: None,
         };
         
         (channel, message_tx)
@@ -155,27 +161,350 @@ impl Channel {
     /// Run the channel event loop.
     pub async fn run(mut self) -> Result<()> {
         tracing::info!(channel_id = %self.id, "channel started");
-        
+
         loop {
+            // Compute sleep duration based on coalesce deadline
+            let sleep_duration = self
+                .coalesce_deadline
+                .map(|deadline| {
+                    let now = tokio::time::Instant::now();
+                    if deadline > now {
+                        deadline - now
+                    } else {
+                        std::time::Duration::from_millis(1)
+                    }
+                })
+                .unwrap_or(std::time::Duration::from_secs(3600)); // Default long timeout if no deadline
+
             tokio::select! {
                 Some(message) = self.message_rx.recv() => {
-                    if let Err(error) = self.handle_message(message).await {
-                        tracing::error!(%error, channel_id = %self.id, "error handling message");
+                    let config = self.deps.runtime_config.coalesce.load();
+                    if self.should_coalesce(&message, &config) {
+                        self.coalesce_buffer.push(message);
+                        self.update_coalesce_deadline(&config).await;
+                    } else {
+                        // Flush any pending buffer before handling this message
+                        if let Err(error) = self.flush_coalesce_buffer().await {
+                            tracing::error!(%error, channel_id = %self.id, "error flushing coalesce buffer");
+                        }
+                        if let Err(error) = self.handle_message(message).await {
+                            tracing::error!(%error, channel_id = %self.id, "error handling message");
+                        }
                     }
                 }
                 Ok(event) = self.event_rx.recv() => {
+                    // Events bypass coalescing - flush buffer first if needed
+                    if let Err(error) = self.flush_coalesce_buffer().await {
+                        tracing::error!(%error, channel_id = %self.id, "error flushing coalesce buffer");
+                    }
                     if let Err(error) = self.handle_event(event).await {
                         tracing::error!(%error, channel_id = %self.id, "error handling event");
+                    }
+                }
+                _ = tokio::time::sleep(sleep_duration), if self.coalesce_deadline.is_some() => {
+                    // Deadline reached - flush the buffer
+                    if let Err(error) = self.flush_coalesce_buffer().await {
+                        tracing::error!(%error, channel_id = %self.id, "error flushing coalesce buffer on deadline");
                     }
                 }
                 else => break,
             }
         }
-        
+
+        // Flush any remaining buffer before shutting down
+        if let Err(error) = self.flush_coalesce_buffer().await {
+            tracing::error!(%error, channel_id = %self.id, "error flushing coalesce buffer on shutdown");
+        }
+
         tracing::info!(channel_id = %self.id, "channel stopped");
         Ok(())
     }
-    
+
+    /// Determine if a message should be coalesced (batched with other messages).
+    ///
+    /// Returns false for:
+    /// - System re-trigger messages (always process immediately)
+    /// - Messages when coalescing is disabled
+    /// - Messages in DMs when multi_user_only is true
+    fn should_coalesce(&self, message: &InboundMessage, config: &crate::config::CoalesceConfig) -> bool {
+        if !config.enabled {
+            return false;
+        }
+        if message.source == "system" {
+            return false;
+        }
+        if config.multi_user_only && self.is_dm() {
+            return false;
+        }
+        true
+    }
+
+    /// Check if this is a DM (direct message) conversation based on conversation_id.
+    fn is_dm(&self) -> bool {
+        // Check conversation_id pattern for DM indicators
+        if let Some(ref conv_id) = self.conversation_id {
+            conv_id.contains(":dm:") || conv_id.starts_with("discord:dm:") || conv_id.starts_with("slack:dm:")
+        } else {
+            // If no conversation_id set yet, default to not DM (safer)
+            false
+        }
+    }
+
+    /// Update the coalesce deadline based on buffer size and config.
+    async fn update_coalesce_deadline(&mut self, config: &crate::config::CoalesceConfig) {
+        let now = tokio::time::Instant::now();
+        
+        if let Some(first_message) = self.coalesce_buffer.first() {
+            let elapsed_since_first = chrono::Utc::now().signed_duration_since(first_message.timestamp);
+            let elapsed_millis = elapsed_since_first.num_milliseconds().max(0) as u64;
+            
+            let max_wait_ms = config.max_wait_ms;
+            let debounce_ms = config.debounce_ms;
+            
+            // If we have enough messages to trigger coalescing (min_messages threshold)
+            if self.coalesce_buffer.len() >= config.min_messages {
+                // Cap at max_wait from the first message
+                let remaining_wait_ms = max_wait_ms.saturating_sub(elapsed_millis);
+                let max_deadline = now + std::time::Duration::from_millis(remaining_wait_ms);
+                
+                // If no deadline set yet, use debounce window
+                // Otherwise, keep existing deadline (don't extend past max_wait)
+                if self.coalesce_deadline.is_none() {
+                    let new_deadline = now + std::time::Duration::from_millis(debounce_ms);
+                    self.coalesce_deadline = Some(new_deadline.min(max_deadline));
+                } else {
+                    // Already have a deadline, cap it at max_wait
+                    self.coalesce_deadline = self.coalesce_deadline.map(|d| d.min(max_deadline));
+                }
+            } else {
+                // Not enough messages yet - set a short debounce window
+                let new_deadline = now + std::time::Duration::from_millis(debounce_ms);
+                self.coalesce_deadline = Some(new_deadline);
+            }
+        }
+    }
+
+    /// Flush the coalesce buffer by processing all buffered messages.
+    ///
+    /// If there's only one message, process it normally.
+    /// If there are multiple messages, batch them into a single turn.
+    async fn flush_coalesce_buffer(&mut self) -> Result<()> {
+        if self.coalesce_buffer.is_empty() {
+            return Ok(());
+        }
+        
+        self.coalesce_deadline = None;
+        
+        let messages: Vec<InboundMessage> = std::mem::take(&mut self.coalesce_buffer);
+        
+        if messages.len() == 1 {
+            // Single message - process normally
+            let message = messages.into_iter().next().unwrap();
+            self.handle_message(message).await
+        } else {
+            // Multiple messages - batch them
+            self.handle_message_batch(messages).await
+        }
+    }
+
+    /// Handle a batch of messages as a single LLM turn.
+    ///
+    /// Formats all messages with attribution and timestamps, persists each
+    /// individually to conversation history, then presents them as one user turn
+    /// with a coalesce hint telling the LLM this is a fast-moving conversation.
+    async fn handle_message_batch(&mut self, messages: Vec<InboundMessage>) -> Result<()> {
+        let message_count = messages.len();
+        let first_timestamp = messages.first().map(|m| m.timestamp).unwrap_or_else(chrono::Utc::now);
+        let last_timestamp = messages.last().map(|m| m.timestamp).unwrap_or(first_timestamp);
+        let elapsed = last_timestamp.signed_duration_since(first_timestamp);
+        let elapsed_secs = elapsed.num_milliseconds() as f64 / 1000.0;
+        
+        tracing::info!(
+            channel_id = %self.id,
+            message_count,
+            elapsed_secs,
+            "handling batched messages"
+        );
+        
+        // Count unique senders for the hint
+        let unique_senders: std::collections::HashSet<_> = messages
+            .iter()
+            .map(|m| &m.sender_id)
+            .collect();
+        let unique_sender_count = unique_senders.len();
+        
+        // Track conversation_id from the first message
+        if self.conversation_id.is_none() {
+            if let Some(first) = messages.first() {
+                self.conversation_id = Some(first.conversation_id.clone());
+            }
+        }
+        
+        // Capture conversation context from the first message
+        if self.conversation_context.is_none() {
+            if let Some(first) = messages.first() {
+                let prompt_engine = self.deps.runtime_config.prompts.load();
+                let server_name = first.metadata.get("discord_guild_name").and_then(|v| v.as_str());
+                let channel_name = first.metadata.get("discord_channel_name").and_then(|v| v.as_str());
+                self.conversation_context = Some(
+                    prompt_engine
+                        .render_conversation_context(&first.source, server_name, channel_name)
+                        .expect("failed to render conversation context"),
+                );
+            }
+        }
+        
+        // Persist each message to conversation log (individual audit trail)
+        let mut user_contents: Vec<UserContent> = Vec::new();
+        let mut conversation_id = String::new();
+        
+        for message in &messages {
+            if message.source != "system" {
+                let sender_name = message.metadata
+                    .get("sender_display_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&message.sender_id);
+                
+                let (raw_text, attachments) = match &message.content {
+                    crate::MessageContent::Text(text) => (text.clone(), Vec::new()),
+                    crate::MessageContent::Media { text, attachments } => {
+                        (text.clone().unwrap_or_default(), attachments.clone())
+                    }
+                };
+                
+                self.state.conversation_logger.log_user_message(
+                    &self.state.channel_id,
+                    sender_name,
+                    &message.sender_id,
+                    &raw_text,
+                    &message.metadata,
+                );
+                self.state.channel_store.upsert(
+                    &message.conversation_id,
+                    &message.metadata,
+                );
+                
+                conversation_id = message.conversation_id.clone();
+                
+                // Format with relative timestamp
+                let relative_secs = message.timestamp.signed_duration_since(first_timestamp).num_seconds();
+                let relative_text = if relative_secs < 1 {
+                    "just now".to_string()
+                } else if relative_secs < 60 {
+                    format!("{}s ago", relative_secs)
+                } else {
+                    format!("{}m ago", relative_secs / 60)
+                };
+                
+                let display_name = message.metadata
+                    .get("sender_display_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&message.sender_id);
+                
+                let formatted_text = format!("[{}] ({}): {}", display_name, relative_text, raw_text);
+                
+                // Download attachments for this message
+                if !attachments.is_empty() {
+                    let attachment_content = download_attachments(&self.deps, &attachments).await;
+                    for content in attachment_content {
+                        user_contents.push(content);
+                    }
+                }
+                
+                user_contents.push(UserContent::text(formatted_text));
+            }
+        }
+        
+        // Combine all user content into a single text
+        let combined_text = format!(
+            "[{} messages arrived rapidly in this channel]\n\n{}",
+            message_count,
+            user_contents.iter()
+                .filter_map(|c| match c {
+                    UserContent::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        
+        // Build system prompt with coalesce hint
+        let system_prompt = self.build_system_prompt_with_coalesce(
+            message_count,
+            elapsed_secs,
+            unique_sender_count,
+        ).await;
+        
+        // Run agent turn
+        let (result, skip_flag) = self.run_agent_turn(
+            &combined_text,
+            &system_prompt,
+            &conversation_id,
+            Vec::new(), // Attachments already formatted into text
+        ).await?;
+        
+        self.handle_agent_result(result, &skip_flag).await;
+        
+        // Check compaction
+        if let Err(error) = self.compactor.check_and_compact().await {
+            tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
+        }
+        
+        // Increment message counter for memory persistence
+        self.message_count += message_count;
+        self.check_memory_persistence().await;
+        
+        Ok(())
+    }
+
+    /// Build system prompt with coalesce hint for batched messages.
+    async fn build_system_prompt_with_coalesce(
+        &self,
+        message_count: usize,
+        elapsed_secs: f64,
+        unique_senders: usize,
+    ) -> String {
+        let rc = &self.deps.runtime_config;
+        let prompt_engine = rc.prompts.load();
+        
+        let identity_context = rc.identity.load().render();
+        let memory_bulletin = rc.memory_bulletin.load();
+        let skills = rc.skills.load();
+        let skills_prompt = skills.render_channel_prompt(&prompt_engine);
+        
+        let browser_enabled = rc.browser_config.load().enabled;
+        let web_search_enabled = rc.brave_search_key.load().is_some();
+        let opencode_enabled = rc.opencode.load().enabled;
+        let worker_capabilities = prompt_engine
+            .render_worker_capabilities(browser_enabled, web_search_enabled, opencode_enabled)
+            .expect("failed to render worker capabilities");
+        
+        let status_text = {
+            let status = self.state.status_block.read().await;
+            status.render()
+        };
+        
+        // Render coalesce hint
+        let elapsed_str = format!("{:.1}s", elapsed_secs);
+        let coalesce_hint = prompt_engine
+            .render_coalesce_hint(message_count, &elapsed_str, unique_senders)
+            .ok();
+        
+        let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
+        
+        prompt_engine
+            .render_channel_prompt(
+                empty_to_none(identity_context),
+                empty_to_none(memory_bulletin.to_string()),
+                empty_to_none(skills_prompt),
+                worker_capabilities,
+                self.conversation_context.clone(),
+                empty_to_none(status_text),
+                coalesce_hint,
+            )
+            .expect("failed to render channel prompt")
+    }
+
     /// Handle an incoming message by running the channel's LLM agent loop.
     ///
     /// The LLM decides which tools to call: reply (to respond), branch (to think),
@@ -296,6 +625,7 @@ impl Channel {
                 worker_capabilities,
                 self.conversation_context.clone(),
                 empty_to_none(status_text),
+                None, // coalesce_hint - only set for batched messages
             )
             .expect("failed to render channel prompt")
     }
