@@ -273,8 +273,9 @@ impl Channel {
 
         let browser_enabled = rc.browser_config.load().enabled;
         let web_search_enabled = rc.brave_search_key.load().is_some();
+        let opencode_enabled = rc.opencode.load().enabled;
         let worker_capabilities = prompt_engine
-            .render_worker_capabilities(browser_enabled, web_search_enabled)
+            .render_worker_capabilities(browser_enabled, web_search_enabled, opencode_enabled)
             .expect("failed to render worker capabilities");
 
         let status_text = {

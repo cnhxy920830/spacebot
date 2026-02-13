@@ -128,12 +128,14 @@ impl PromptEngine {
         &self,
         browser_enabled: bool,
         web_search_enabled: bool,
+        opencode_enabled: bool,
     ) -> Result<String> {
         self.render(
             "fragments/worker_capabilities",
             context! {
                 browser_enabled => browser_enabled,
                 web_search_enabled => web_search_enabled,
+                opencode_enabled => opencode_enabled,
             },
         )
     }
@@ -322,24 +324,8 @@ const INGESTION_TEMPLATE: &str = include_str!("../../prompts/en/ingestion.md.j2"
 // Fragment Templates
 // ============================================================================
 
-const FRAGMENT_WORKER_CAPABILITIES: &str = r#"
-## Worker Capabilities
-
-When you spawn a worker, it has access to the following tools:
-
-- **shell** — run shell commands
-- **file** — read, write, search, and list files  
-- **exec** — run subprocesses with environment control
-- **set_status** — update worker status visible in your status block
-{%- if browser_enabled %}
-- **browser** — browse web pages, take screenshots, click elements, fill forms
-{%- endif %}
-{%- if web_search_enabled %}
-- **web_search** — search the web via Brave Search API
-{%- endif %}
-
-Workers do NOT have conversation context or memory access. Include all necessary context in the task description.
-"#;
+const FRAGMENT_WORKER_CAPABILITIES: &str =
+    include_str!("../../prompts/en/fragments/worker_capabilities.md.j2");
 
 const FRAGMENT_CONVERSATION_CONTEXT: &str = r#"
 Platform: {{ platform }}
