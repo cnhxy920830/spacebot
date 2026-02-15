@@ -5,4 +5,3 @@
 # Interface
 interface/node_modules/
 interface/dist/
-interface/bun.lock
