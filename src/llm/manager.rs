@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
+const OPENAI_DEFAULT_CHAT_COMPLETIONS_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
+
 /// Manages LLM provider clients and tracks rate limit state.
 pub struct LlmManager {
     config: LlmConfig,
@@ -102,6 +104,14 @@ impl LlmManager {
         &self.http_client
     }
 
+    /// Resolve the OpenAI-compatible chat completions endpoint.
+    ///
+    /// If `llm.openai_base_url` is configured, this method appends
+    /// `/chat/completions` unless the URL already points to that endpoint.
+    pub fn openai_chat_completions_endpoint(&self) -> String {
+        normalize_openai_chat_completions_endpoint(self.config.openai_base_url.as_deref())
+    }
+
     /// Resolve a model name to provider and model components.
     /// Format: "provider/model-name" or just "model-name" (defaults to anthropic).
     pub fn resolve_model(&self, model_name: &str) -> Result<(String, String)> {
@@ -138,4 +148,17 @@ impl LlmManager {
             .await
             .retain(|_, limited_at| limited_at.elapsed().as_secs() < cooldown_secs);
     }
+}
+
+fn normalize_openai_chat_completions_endpoint(base_url: Option<&str>) -> String {
+    let Some(base_url) = base_url.map(str::trim).filter(|url| !url.is_empty()) else {
+        return OPENAI_DEFAULT_CHAT_COMPLETIONS_ENDPOINT.to_string();
+    };
+
+    if base_url.ends_with("/chat/completions") {
+        return base_url.to_string();
+    }
+
+    let trimmed_base = base_url.trim_end_matches('/');
+    format!("{trimmed_base}/chat/completions")
 }

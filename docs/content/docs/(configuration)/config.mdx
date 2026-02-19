@@ -23,6 +23,8 @@ spacebot --config /path/to.toml  # CLI override
 [llm]
 anthropic_key = "env:ANTHROPIC_API_KEY"
 openai_key = "env:OPENAI_API_KEY"
+# Optional OpenAI-compatible base URL (e.g. Ark):
+# openai_base_url = "https://ark.cn-beijing.volces.com/api/v3"
 openrouter_key = "env:OPENROUTER_API_KEY"
 
 # --- Instance Defaults ---
@@ -260,6 +262,7 @@ System prompts (channel, branch, worker, compactor, cortex, etc.) are Jinja2 tem
 |-----|------|---------|-------------|
 | `anthropic_key` | string | None | Anthropic API key (or `env:VAR_NAME`) |
 | `openai_key` | string | None | OpenAI API key (or `env:VAR_NAME`) |
+| `openai_base_url` | string | None | Optional OpenAI-compatible base URL. If set, Spacebot calls `{base_url}/chat/completions`. |
 | `openrouter_key` | string | None | OpenRouter API key (or `env:VAR_NAME`) |
 
 At least one key must be provided (via config or environment).

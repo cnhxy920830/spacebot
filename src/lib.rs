@@ -12,9 +12,9 @@ pub mod daemon;
 #[path = "daemon_windows.rs"]
 pub mod daemon;
 
+pub mod cron;
 pub mod db;
 pub mod error;
-pub mod cron;
 pub mod hooks;
 pub mod identity;
 pub mod llm;
@@ -188,8 +188,12 @@ pub struct AgentDeps {
 }
 
 impl AgentDeps {
-    pub fn memory_search(&self) -> &Arc<memory::MemorySearch> { &self.memory_search }
-    pub fn llm_manager(&self) -> &Arc<llm::LlmManager> { &self.llm_manager }
+    pub fn memory_search(&self) -> &Arc<memory::MemorySearch> {
+        &self.memory_search
+    }
+    pub fn llm_manager(&self) -> &Arc<llm::LlmManager> {
+        &self.llm_manager
+    }
 
     /// Load the current routing config snapshot.
     pub fn routing(&self) -> arc_swap::Guard<Arc<llm::RoutingConfig>> {
@@ -305,9 +309,21 @@ pub enum StatusUpdate {
     Thinking,
     /// Cancel the typing indicator (e.g. when the skip tool fires).
     StopTyping,
-    ToolStarted { tool_name: String },
-    ToolCompleted { tool_name: String },
-    BranchStarted { branch_id: BranchId },
-    WorkerStarted { worker_id: WorkerId, task: String },
-    WorkerCompleted { worker_id: WorkerId, result: String },
+    ToolStarted {
+        tool_name: String,
+    },
+    ToolCompleted {
+        tool_name: String,
+    },
+    BranchStarted {
+        branch_id: BranchId,
+    },
+    WorkerStarted {
+        worker_id: WorkerId,
+        task: String,
+    },
+    WorkerCompleted {
+        worker_id: WorkerId,
+        result: String,
+    },
 }

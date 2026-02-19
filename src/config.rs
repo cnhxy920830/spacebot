@@ -75,6 +75,10 @@ impl Default for ApiConfig {
 pub struct LlmConfig {
     pub anthropic_key: Option<String>,
     pub openai_key: Option<String>,
+    /// Optional OpenAI-compatible base URL (e.g. https://ark.cn-beijing.volces.com/api/v3).
+    ///
+    /// The runtime appends `/chat/completions` when only a base path is provided.
+    pub openai_base_url: Option<String>,
     pub openrouter_key: Option<String>,
     pub zhipu_key: Option<String>,
     pub groq_key: Option<String>,
@@ -901,6 +905,7 @@ fn default_api_bind() -> String {
 struct TomlLlmConfig {
     anthropic_key: Option<String>,
     openai_key: Option<String>,
+    openai_base_url: Option<String>,
     openrouter_key: Option<String>,
     zhipu_key: Option<String>,
     groq_key: Option<String>,
@@ -1249,6 +1254,9 @@ impl Config {
         let llm = LlmConfig {
             anthropic_key: std::env::var("ANTHROPIC_API_KEY").ok(),
             openai_key: std::env::var("OPENAI_API_KEY").ok(),
+            openai_base_url: std::env::var("OPENAI_BASE_URL")
+                .ok()
+                .or_else(|| std::env::var("OPENAI_API_BASE").ok()),
             openrouter_key: std::env::var("OPENROUTER_API_KEY").ok(),
             zhipu_key: std::env::var("ZHIPU_API_KEY").ok(),
             groq_key: std::env::var("GROQ_API_KEY").ok(),
@@ -1335,6 +1343,13 @@ impl Config {
                 .as_deref()
                 .and_then(resolve_env_value)
                 .or_else(|| std::env::var("OPENAI_API_KEY").ok()),
+            openai_base_url: toml
+                .llm
+                .openai_base_url
+                .as_deref()
+                .and_then(resolve_env_value)
+                .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
+                .or_else(|| std::env::var("OPENAI_API_BASE").ok()),
             openrouter_key: toml
                 .llm
                 .openrouter_key
