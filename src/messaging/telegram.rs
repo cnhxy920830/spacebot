@@ -736,14 +736,47 @@ fn split_message(text: &str, max_len: usize) -> Vec<String> {
             break;
         }
 
-        let split_at = remaining[..max_len]
+        let mut hard_split = remaining.floor_char_boundary(max_len);
+        if hard_split == 0 {
+            hard_split = remaining
+                .char_indices()
+                .nth(1)
+                .map(|(index, _)| index)
+                .unwrap_or(remaining.len());
+        }
+
+        let split_at = remaining[..hard_split]
             .rfind('\n')
-            .or_else(|| remaining[..max_len].rfind(' '))
-            .unwrap_or(max_len);
+            .or_else(|| remaining[..hard_split].rfind(' '))
+            .filter(|index| *index > 0)
+            .unwrap_or(hard_split);
 
         chunks.push(remaining[..split_at].to_string());
         remaining = remaining[split_at..].trim_start();
     }
 
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_message_handles_multibyte_utf8_safely() {
+        let text = "过".repeat(1500);
+        let chunks = split_message(&text, MAX_MESSAGE_LENGTH);
+
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= MAX_MESSAGE_LENGTH));
+    }
+
+    #[test]
+    fn split_message_never_emits_empty_chunks() {
+        let text = format!(" {}", "a".repeat(MAX_MESSAGE_LENGTH + 32));
+        let chunks = split_message(&text, MAX_MESSAGE_LENGTH);
+
+        assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
+    }
 }
