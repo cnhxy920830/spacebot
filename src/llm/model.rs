@@ -81,6 +81,7 @@ impl SpacebotModel {
             "deepseek" => self.call_deepseek(request).await,
             "xai" => self.call_xai(request).await,
             "mistral" => self.call_mistral(request).await,
+            "ollama" => self.call_ollama(request).await,
             "opencode-zen" => self.call_opencode_zen(request).await,
             other => Err(CompletionError::ProviderError(format!(
                 "unknown provider: {other}"
@@ -181,94 +182,119 @@ impl CompletionModel for SpacebotModel {
         &self,
         request: CompletionRequest,
     ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        let Some(routing) = &self.routing else {
-            // No routing config — just call the model directly, no fallback/retry
-            return self.attempt_completion(request).await;
-        };
+        #[cfg(feature = "metrics")]
+        let start = std::time::Instant::now();
 
-        let cooldown = routing.rate_limit_cooldown_secs;
-        let fallbacks = routing.get_fallbacks(&self.full_model_name);
-        let mut last_error: Option<CompletionError> = None;
+        let result = async move {
+            let Some(routing) = &self.routing else {
+                // No routing config — just call the model directly, no fallback/retry
+                return self.attempt_completion(request).await;
+            };
 
-        // Try the primary model (with retries) unless it's in rate-limit cooldown
-        // and we have fallbacks to try instead.
-        let primary_rate_limited = self
-            .llm_manager
-            .is_rate_limited(&self.full_model_name, cooldown)
-            .await;
+            let cooldown = routing.rate_limit_cooldown_secs;
+            let fallbacks = routing.get_fallbacks(&self.full_model_name);
+            let mut last_error: Option<CompletionError> = None;
 
-        let skip_primary = primary_rate_limited && !fallbacks.is_empty();
-
-        if skip_primary {
-            tracing::debug!(
-                model = %self.full_model_name,
-                "primary model in rate-limit cooldown, skipping to fallbacks"
-            );
-        } else {
-            match self
-                .attempt_with_retries(&self.full_model_name, &request)
-                .await
-            {
-                Ok(response) => return Ok(response),
-                Err((error, was_rate_limit)) => {
-                    if was_rate_limit {
-                        self.llm_manager
-                            .record_rate_limit(&self.full_model_name)
-                            .await;
-                    }
-                    if fallbacks.is_empty() {
-                        // No fallbacks — this is the final error
-                        return Err(error);
-                    }
-                    tracing::warn!(
-                        model = %self.full_model_name,
-                        "primary model exhausted retries, trying fallbacks"
-                    );
-                    last_error = Some(error);
-                }
-            }
-        }
-
-        // Try fallback chain, each with their own retry loop
-        for (index, fallback_name) in fallbacks.iter().take(MAX_FALLBACK_ATTEMPTS).enumerate() {
-            if self
+            // Try the primary model (with retries) unless it's in rate-limit cooldown
+            // and we have fallbacks to try instead.
+            let primary_rate_limited = self
                 .llm_manager
-                .is_rate_limited(fallback_name, cooldown)
-                .await
-            {
+                .is_rate_limited(&self.full_model_name, cooldown)
+                .await;
+
+            let skip_primary = primary_rate_limited && !fallbacks.is_empty();
+
+            if skip_primary {
                 tracing::debug!(
-                    fallback = %fallback_name,
-                    "fallback model in cooldown, skipping"
+                    model = %self.full_model_name,
+                    "primary model in rate-limit cooldown, skipping to fallbacks"
                 );
-                continue;
+            } else {
+                match self
+                    .attempt_with_retries(&self.full_model_name, &request)
+                    .await
+                {
+                    Ok(response) => return Ok(response),
+                    Err((error, was_rate_limit)) => {
+                        if was_rate_limit {
+                            self.llm_manager
+                                .record_rate_limit(&self.full_model_name)
+                                .await;
+                        }
+                        if fallbacks.is_empty() {
+                            // No fallbacks — this is the final error
+                            return Err(error);
+                        }
+                        tracing::warn!(
+                            model = %self.full_model_name,
+                            "primary model exhausted retries, trying fallbacks"
+                        );
+                        last_error = Some(error);
+                    }
+                }
             }
 
-            match self.attempt_with_retries(fallback_name, &request).await {
-                Ok(response) => {
-                    tracing::info!(
-                        original = %self.full_model_name,
+            // Try fallback chain, each with their own retry loop
+            for (index, fallback_name) in fallbacks.iter().take(MAX_FALLBACK_ATTEMPTS).enumerate() {
+                if self
+                    .llm_manager
+                    .is_rate_limited(fallback_name, cooldown)
+                    .await
+                {
+                    tracing::debug!(
                         fallback = %fallback_name,
-                        attempt = index + 1,
-                        "fallback model succeeded"
+                        "fallback model in cooldown, skipping"
                     );
-                    return Ok(response);
+                    continue;
                 }
-                Err((error, was_rate_limit)) => {
-                    if was_rate_limit {
-                        self.llm_manager.record_rate_limit(fallback_name).await;
+
+                match self.attempt_with_retries(fallback_name, &request).await {
+                    Ok(response) => {
+                        tracing::info!(
+                            original = %self.full_model_name,
+                            fallback = %fallback_name,
+                            attempt = index + 1,
+                            "fallback model succeeded"
+                        );
+                        return Ok(response);
                     }
-                    tracing::warn!(
-                        fallback = %fallback_name,
-                        "fallback model exhausted retries, continuing chain"
-                    );
-                    last_error = Some(error);
+                    Err((error, was_rate_limit)) => {
+                        if was_rate_limit {
+                            self.llm_manager.record_rate_limit(fallback_name).await;
+                        }
+                        tracing::warn!(
+                            fallback = %fallback_name,
+                            "fallback model exhausted retries, continuing chain"
+                        );
+                        last_error = Some(error);
+                    }
                 }
             }
+
+            Err(last_error.unwrap_or_else(|| {
+                CompletionError::ProviderError("all models in fallback chain failed".into())
+            }))
+        }
+        .await;
+
+        #[cfg(feature = "metrics")]
+        {
+            let elapsed = start.elapsed().as_secs_f64();
+            let metrics = crate::telemetry::Metrics::global();
+            // TODO: agent_id and tier are "unknown" because SpacebotModel doesn't
+            // carry process context. Thread agent_id/ProcessType through to get
+            // per-agent, per-tier breakdowns.
+            metrics
+                .llm_requests_total
+                .with_label_values(&["unknown", &self.full_model_name, "unknown"])
+                .inc();
+            metrics
+                .llm_request_duration_seconds
+                .with_label_values(&["unknown", &self.full_model_name, "unknown"])
+                .observe(elapsed);
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            CompletionError::ProviderError("all models in fallback chain failed".into())
-        }))
+        result
     }
 
     async fn stream(
@@ -558,7 +584,23 @@ impl SpacebotModel {
             .llm_manager
             .get_api_key(provider_id)
             .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+        self.call_openai_compatible_with_optional_auth(
+            request,
+            provider_display_name,
+            endpoint,
+            Some(api_key),
+        )
+        .await
+    }
 
+    /// Generic OpenAI-compatible API call with optional bearer auth.
+    async fn call_openai_compatible_with_optional_auth(
+        &self,
+        request: CompletionRequest,
+        provider_display_name: &str,
+        endpoint: &str,
+        api_key: Option<String>,
+    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
         let mut messages = Vec::new();
 
         if let Some(preamble) = &request.preamble {
@@ -601,11 +643,13 @@ impl SpacebotModel {
             body["tools"] = serde_json::json!(tools);
         }
 
-        let response = self
-            .llm_manager
-            .http_client()
-            .post(endpoint)
-            .header("authorization", format!("Bearer {api_key}"))
+        let response = self.llm_manager.http_client().post(endpoint);
+        let response = if let Some(api_key) = api_key {
+            response.header("authorization", format!("Bearer {api_key}"))
+        } else {
+            response
+        };
+        let response = response
             .header("content-type", "application/json")
             .json(&body)
             .send()
@@ -715,6 +759,18 @@ impl SpacebotModel {
         .await
     }
 
+    async fn call_ollama(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+        let base_url = normalize_ollama_base_url(self.llm_manager.ollama_base_url());
+        let endpoint = format!("{base_url}/v1/chat/completions");
+        let api_key = self.llm_manager.get_api_key("ollama").ok();
+
+        self.call_openai_compatible_with_optional_auth(request, "Ollama", &endpoint, api_key)
+            .await
+    }
+
     async fn call_opencode_zen(
         &self,
         request: CompletionRequest,
@@ -735,7 +791,7 @@ impl SpacebotModel {
         self.call_openai_compatible(
             request,
             "nvidia",
-            "NVIDIA",
+            "NVIDIA NIM",
             "https://integrate.api.nvidia.com/v1/chat/completions",
         )
         .await
@@ -743,6 +799,22 @@ impl SpacebotModel {
 }
 
 // --- Helpers ---
+
+fn normalize_ollama_base_url(configured: Option<String>) -> String {
+    let mut base_url = configured
+        .unwrap_or_else(|| "http://localhost:11434".to_string())
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+
+    if base_url.ends_with("/api") {
+        base_url.truncate(base_url.len() - "/api".len());
+    } else if base_url.ends_with("/v1") {
+        base_url.truncate(base_url.len() - "/v1".len());
+    }
+
+    base_url
+}
 
 fn tool_result_content_to_string(content: &OneOrMany<rig::message::ToolResultContent>) -> String {
     content
@@ -1039,14 +1111,32 @@ fn parse_openai_response(
         }
     }
 
+    // Some reasoning models (e.g., NVIDIA kimi-k2.5) return reasoning in a separate field
+    if assistant_content.is_empty() {
+        if let Some(reasoning) = choice["reasoning_content"].as_str() {
+            if !reasoning.is_empty() {
+                tracing::debug!(
+                    provider = %provider_label,
+                    "extracted reasoning_content as main content"
+                );
+                assistant_content.push(AssistantContent::Text(Text {
+                    text: reasoning.to_string(),
+                }));
+            }
+        }
+    }
+
     if let Some(tool_calls) = choice["tool_calls"].as_array() {
         for tc in tool_calls {
             let id = tc["id"].as_str().unwrap_or("").to_string();
             let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-            // OpenAI returns arguments as a JSON string, parse it back to Value
-            let arguments = tc["function"]["arguments"]
+            // OpenAI-compatible APIs usually return arguments as a JSON string.
+            // Some providers return it as a raw JSON object instead.
+            let arguments_field = &tc["function"]["arguments"];
+            let arguments = arguments_field
                 .as_str()
-                .and_then(|s| serde_json::from_str(s).ok())
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .or_else(|| arguments_field.as_object().map(|_| arguments_field.clone()))
                 .unwrap_or(serde_json::json!({}));
             assistant_content.push(AssistantContent::ToolCall(make_tool_call(
                 id, name, arguments,

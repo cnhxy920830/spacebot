@@ -25,6 +25,8 @@ pub mod prompts;
 pub mod secrets;
 pub mod settings;
 pub mod skills;
+#[cfg(feature = "metrics")]
+pub mod telemetry;
 pub mod tools;
 pub mod update;
 
@@ -221,6 +223,9 @@ pub struct InboundMessage {
     pub content: MessageContent,
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub metadata: HashMap<String, serde_json::Value>,
+    /// Platform-formatted author display (e.g., "Alice (<@123>)" for Discord).
+    /// If None, channel falls back to sender_display_name from metadata.
+    pub formatted_author: Option<String>,
 }
 
 /// Message content variants.

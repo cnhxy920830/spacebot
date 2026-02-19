@@ -131,7 +131,7 @@ pub fn defaults_for_provider(provider: &str) -> RoutingConfig {
             RoutingConfig::for_model("openrouter/anthropic/claude-sonnet-4-20250514".into())
         }
         "openai" => RoutingConfig::for_model("openai/gpt-4.1".into()),
-        "nvidia" => RoutingConfig::for_model("nvidia/meta/llama-3.1-70b-instruct".into()),
+        "nvidia" => RoutingConfig::for_model("nvidia/meta/llama-3.1-405b-instruct".into()),
         "zhipu" => RoutingConfig::for_model("zhipu/glm-4-plus".into()),
         "groq" => RoutingConfig::for_model("groq/llama-3.3-70b-versatile".into()),
         "together" => RoutingConfig::for_model(
@@ -143,6 +143,7 @@ pub fn defaults_for_provider(provider: &str) -> RoutingConfig {
         "deepseek" => RoutingConfig::for_model("deepseek/deepseek-chat".into()),
         "xai" => RoutingConfig::for_model("xai/grok-2-latest".into()),
         "mistral" => RoutingConfig::for_model("mistral/mistral-large-latest".into()),
+        "ollama" => RoutingConfig::for_model("ollama/gemma3".into()),
         "opencode-zen" => RoutingConfig::for_model("opencode-zen/kimi-k2.5".into()),
         _ => RoutingConfig::default(),
     }
@@ -162,6 +163,7 @@ pub fn provider_to_prefix(provider: &str) -> &str {
         "deepseek" => "deepseek/",
         "xai" => "xai/",
         "mistral" => "mistral/",
+        "ollama" => "ollama/",
         "opencode-zen" => "opencode-zen/",
         _ => "",
     }

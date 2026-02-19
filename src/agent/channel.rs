@@ -1020,6 +1020,7 @@ impl Channel {
                     content: crate::MessageContent::Text(retrigger_message),
                     timestamp: chrono::Utc::now(),
                     metadata: std::collections::HashMap::new(),
+                    formatted_author: None,
                 };
                 if let Err(error) = self.self_tx.try_send(synthetic) {
                     tracing::warn!(%error, "failed to re-trigger channel after process completion");
@@ -1443,6 +1444,12 @@ where
     E: std::fmt::Display + Send + 'static,
 {
     tokio::spawn(async move {
+        #[cfg(feature = "metrics")]
+        crate::telemetry::Metrics::global()
+            .active_workers
+            .with_label_values(&[&*agent_id])
+            .inc();
+
         let (result_text, notify) = match future.await {
             Ok(text) => (text, true),
             Err(error) => {
@@ -1450,6 +1457,12 @@ where
                 (format!("Worker failed: {error}"), true)
             }
         };
+        #[cfg(feature = "metrics")]
+        crate::telemetry::Metrics::global()
+            .active_workers
+            .with_label_values(&[&*agent_id])
+            .dec();
+
         let _ = event_tx.send(ProcessEvent::WorkerComplete {
             agent_id,
             worker_id,
@@ -1524,10 +1537,16 @@ fn format_user_message(raw_text: &str, message: &InboundMessage) -> String {
         return raw_text.to_string();
     }
 
+    // Use platform-formatted author if available, fall back to metadata
     let display_name = message
-        .metadata
-        .get("sender_display_name")
-        .and_then(|v| v.as_str())
+        .formatted_author
+        .as_deref()
+        .or_else(|| {
+            message
+                .metadata
+                .get("sender_display_name")
+                .and_then(|v| v.as_str())
+        })
         .unwrap_or(&message.sender_id);
 
     let bot_tag = if message
@@ -1559,7 +1578,7 @@ fn format_user_message(raw_text: &str, message: &InboundMessage) -> String {
         })
         .unwrap_or_default();
 
-    format!("[{display_name}]{bot_tag}{reply_context}: {raw_text}")
+    format!("{display_name}{bot_tag}{reply_context}: {raw_text}")
 }
 
 /// Check if a ProcessEvent is targeted at a specific channel.
