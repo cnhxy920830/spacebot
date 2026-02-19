@@ -1,20 +1,36 @@
-//! Process daemonization and IPC for background operation.
+//! Process daemonization and IPC for background operation on Windows.
 
 use crate::config::{Config, TelemetryConfig};
 
-use anyhow::{Context as _, anyhow};
+use anyhow::Context as _;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithHttpConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::windows::named_pipe::{
+    ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+};
 use tokio::sync::watch;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_PIPE_BUSY, STILL_ACTIVE};
+use windows_sys::Win32::System::Threading::{
+    CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS, GetExitCodeProcess, OpenProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
+use std::ffi::OsString;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
+
+const DAEMON_CHILD_ENV: &str = "SPACEBOT_DAEMON_CHILD";
+const PIPE_CONNECT_ATTEMPTS: usize = 30;
+const PIPE_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Commands sent from CLI client to the running daemon.
 #[derive(Debug, Serialize, Deserialize)]
@@ -44,7 +60,7 @@ impl DaemonPaths {
     pub fn new(instance_dir: &std::path::Path) -> Self {
         Self {
             pid_file: instance_dir.join("spacebot.pid"),
-            socket: instance_dir.join("spacebot.sock"),
+            socket: instance_dir.join("spacebot.pipe"),
             log_dir: instance_dir.join("logs"),
         }
     }
@@ -54,36 +70,26 @@ impl DaemonPaths {
     }
 }
 
-/// Check whether a daemon is already running by testing PID file liveness
-/// and socket connectivity.
+/// Check whether a daemon is already running by testing PID file liveness.
 pub fn is_running(paths: &DaemonPaths) -> Option<u32> {
     let pid = read_pid_file(&paths.pid_file)?;
 
-    // Verify the process is actually alive
     if !is_process_alive(pid) {
         cleanup_stale_files(paths);
         return None;
     }
 
-    // Double-check by trying to connect to the socket
-    if paths.socket.exists() {
-        if let Ok(stream) = std::os::unix::net::UnixStream::connect(&paths.socket) {
-            drop(stream);
-            return Some(pid);
-        }
-        // Socket exists but can't connect — stale
-        cleanup_stale_files(paths);
-        return None;
-    }
-
-    // PID alive but no socket — process may be starting up or crashed
-    // without cleanup. Trust the PID.
+    // If the process is alive, treat it as running.
     Some(pid)
 }
 
-/// Daemonize the current process. Returns in the child; the parent prints
-/// a message and exits.
+/// Daemonize the current process by spawning a detached child process.
 pub fn daemonize(paths: &DaemonPaths) -> anyhow::Result<()> {
+    if std::env::var(DAEMON_CHILD_ENV).as_deref() == Ok("1") {
+        write_pid_file(paths, std::process::id())?;
+        return Ok(());
+    }
+
     std::fs::create_dir_all(&paths.log_dir).with_context(|| {
         format!(
             "failed to create log directory: {}",
@@ -103,17 +109,26 @@ pub fn daemonize(paths: &DaemonPaths) -> anyhow::Result<()> {
         .open(paths.log_dir.join("spacebot.err"))
         .context("failed to open stderr log")?;
 
-    let daemonize = daemonize::Daemonize::new()
-        .pid_file(&paths.pid_file)
-        .chown_pid_file(true)
-        .stdout(stdout)
-        .stderr(stderr);
+    let executable = std::env::current_exe().context("failed to resolve current executable")?;
+    let mut command = Command::new(executable);
 
-    daemonize
-        .start()
-        .map_err(|error| anyhow!("failed to daemonize: {error}"))?;
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    command.args(args);
+    command.env(DAEMON_CHILD_ENV, "1");
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::from(stdout));
+    command.stderr(Stdio::from(stderr));
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
 
-    Ok(())
+    let child = command
+        .spawn()
+        .context("failed to spawn detached daemon process")?;
+
+    write_pid_file(paths, child.id())?;
+
+    // Match Unix daemonization behavior: parent exits after successfully
+    // launching the detached child.
+    std::process::exit(0);
 }
 
 /// Initialize tracing for background (daemon) mode.
@@ -127,11 +142,11 @@ pub fn init_background_tracing(
     telemetry: &TelemetryConfig,
 ) -> Option<SdkTracerProvider> {
     let file_appender = tracing_appender::rolling::daily(&paths.log_dir, "spacebot.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     // Leak the guard so the non-blocking writer lives for the entire process.
     // The process owns this — it's cleaned up on exit.
-    std::mem::forget(_guard);
+    std::mem::forget(guard);
 
     let filter = build_env_filter(debug);
     let fmt_layer = tracing_subscriber::fmt::layer()
@@ -263,54 +278,84 @@ fn build_otlp_provider(telemetry: &TelemetryConfig) -> Option<SdkTracerProvider>
 pub async fn start_ipc_server(
     paths: &DaemonPaths,
 ) -> anyhow::Result<(watch::Receiver<bool>, tokio::task::JoinHandle<()>)> {
-    // Ensure the instance directory exists (e.g. on first run)
-    if let Some(parent) = paths.socket.parent() {
+    if let Some(parent) = paths.pid_file.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!("failed to create instance directory: {}", parent.display())
         })?;
     }
 
-    // Clean up any stale socket file
-    if paths.socket.exists() {
-        std::fs::remove_file(&paths.socket).with_context(|| {
-            format!("failed to remove stale socket: {}", paths.socket.display())
-        })?;
-    }
-
-    let listener = UnixListener::bind(&paths.socket)
-        .with_context(|| format!("failed to bind IPC socket: {}", paths.socket.display()))?;
+    write_pid_file(paths, std::process::id())?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let start_time = Instant::now();
-    let socket_path = paths.socket.clone();
+    let pipe_name = pipe_name(paths);
 
-    let handle = tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _address)) => {
-                    let shutdown_tx = shutdown_tx.clone();
-                    let uptime = start_time.elapsed();
-                    tokio::spawn(async move {
-                        if let Err(error) =
-                            handle_ipc_connection(stream, &shutdown_tx, uptime).await
-                        {
-                            tracing::warn!(%error, "IPC connection handler failed");
-                        }
-                    });
-                }
+    let handle = tokio::task::spawn_blocking({
+        let mut shutdown_rx = shutdown_rx.clone();
+        let shutdown_tx = shutdown_tx.clone();
+
+        move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+            {
+                Ok(runtime) => runtime,
                 Err(error) => {
-                    tracing::warn!(%error, "failed to accept IPC connection");
+                    tracing::error!(%error, "failed to create IPC runtime");
+                    return;
                 }
-            }
-        }
-    });
+            };
 
-    // Spawn a cleanup task that removes the socket file when the server shuts down
-    let cleanup_socket = socket_path.clone();
-    let mut cleanup_rx = shutdown_rx.clone();
-    tokio::spawn(async move {
-        let _ = cleanup_rx.wait_for(|shutdown| *shutdown).await;
-        let _ = std::fs::remove_file(&cleanup_socket);
+            runtime.block_on(async move {
+                let mut first_pipe_instance = true;
+
+                loop {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+
+                    let mut server_options = ServerOptions::new();
+                    if first_pipe_instance {
+                        server_options.first_pipe_instance(true);
+                    }
+
+                    let server = match server_options.create(&pipe_name) {
+                        Ok(server) => server,
+                        Err(error) => {
+                            tracing::warn!(%error, pipe = %pipe_name, "failed to create IPC named pipe server");
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            first_pipe_instance = false;
+                            continue;
+                        }
+                    };
+
+                    first_pipe_instance = false;
+
+                    tokio::select! {
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        result = server.connect() => {
+                            match result {
+                                Ok(()) => {
+                                    if let Err(error) =
+                                        handle_ipc_connection(server, &shutdown_tx, start_time.elapsed()).await
+                                    {
+                                        tracing::warn!(%error, "IPC connection handler failed");
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "failed to accept IPC connection");
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
     });
 
     Ok((shutdown_rx, handle))
@@ -318,11 +363,11 @@ pub async fn start_ipc_server(
 
 /// Handle a single IPC client connection.
 async fn handle_ipc_connection(
-    stream: UnixStream,
+    stream: NamedPipeServer,
     shutdown_tx: &watch::Sender<bool>,
-    uptime: std::time::Duration,
+    uptime: Duration,
 ) -> anyhow::Result<()> {
-    let (reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(reader);
     let mut line = String::new();
     reader.read_line(&mut line).await?;
@@ -352,18 +397,17 @@ async fn handle_ipc_connection(
 
 /// Send a command to the running daemon and return the response.
 pub async fn send_command(paths: &DaemonPaths, command: IpcCommand) -> anyhow::Result<IpcResponse> {
-    let stream = UnixStream::connect(&paths.socket)
+    let pipe_name = pipe_name(paths);
+    let mut stream = connect_pipe_with_retry(&pipe_name)
         .await
         .with_context(|| "failed to connect to spacebot daemon. is it running?")?;
 
-    let (reader, mut writer) = stream.into_split();
-
     let mut command_bytes = serde_json::to_vec(&command)?;
     command_bytes.push(b'\n');
-    writer.write_all(&command_bytes).await?;
-    writer.flush().await?;
+    stream.write_all(&command_bytes).await?;
+    stream.flush().await?;
 
-    let mut reader = tokio::io::BufReader::new(reader);
+    let mut reader = tokio::io::BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).await?;
 
@@ -393,8 +437,18 @@ fn read_pid_file(path: &std::path::Path) -> Option<u32> {
 }
 
 fn is_process_alive(pid: u32) -> bool {
-    // kill(pid, 0) checks if the process exists without sending a signal
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+
+        let mut exit_code = 0_u32;
+        let ok = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+
+        ok != 0 && exit_code == STILL_ACTIVE as u32
+    }
 }
 
 fn cleanup_stale_files(paths: &DaemonPaths) {
@@ -409,7 +463,58 @@ pub fn wait_for_exit(pid: u32) -> bool {
         if !is_process_alive(pid) {
             return true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100));
     }
     false
+}
+
+async fn connect_pipe_with_retry(pipe_name: &str) -> std::io::Result<NamedPipeClient> {
+    for attempt in 0..PIPE_CONNECT_ATTEMPTS {
+        match ClientOptions::new().open(pipe_name) {
+            Ok(client) => return Ok(client),
+            Err(error) => {
+                let is_pipe_busy = error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32);
+                let waiting_for_server =
+                    is_pipe_busy || error.kind() == std::io::ErrorKind::NotFound;
+
+                if waiting_for_server && attempt + 1 < PIPE_CONNECT_ATTEMPTS {
+                    tokio::time::sleep(PIPE_CONNECT_RETRY_DELAY).await;
+                    continue;
+                }
+
+                return Err(error);
+            }
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "timed out connecting to daemon pipe",
+    ))
+}
+
+fn pipe_name(paths: &DaemonPaths) -> String {
+    let key = paths.socket.to_string_lossy();
+    let hash = stable_hash(key.as_bytes());
+    format!(r"\\.\pipe\spacebot-{hash:016x}")
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn write_pid_file(paths: &DaemonPaths, pid: u32) -> anyhow::Result<()> {
+    if let Some(parent) = paths.pid_file.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create PID file directory: {}", parent.display())
+        })?;
+    }
+
+    std::fs::write(&paths.pid_file, pid.to_string())
+        .with_context(|| format!("failed to write PID file: {}", paths.pid_file.display()))
 }

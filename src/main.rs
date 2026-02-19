@@ -133,11 +133,17 @@ fn cmd_start(
     foreground: bool,
 ) -> anyhow::Result<()> {
     let paths = spacebot::daemon::DaemonPaths::from_default();
+    #[cfg(windows)]
+    let is_daemon_child = std::env::var("SPACEBOT_DAEMON_CHILD").as_deref() == Ok("1");
+    #[cfg(not(windows))]
+    let is_daemon_child = false;
 
     // Bail if already running
-    if let Some(pid) = spacebot::daemon::is_running(&paths) {
-        eprintln!("spacebot is already running (pid {pid})");
-        std::process::exit(1);
+    if !is_daemon_child {
+        if let Some(pid) = spacebot::daemon::is_running(&paths) {
+            eprintln!("spacebot is already running (pid {pid})");
+            std::process::exit(1);
+        }
     }
 
     // Run onboarding interactively before daemonizing

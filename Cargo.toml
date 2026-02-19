@@ -78,10 +78,6 @@ schemars = "0.8"
 clap = { version = "4.5", features = ["derive"] }
 dialoguer = { version = "0.11", features = ["password"] }
 
-# Daemonization
-daemonize = "0.5"
-libc = "0.2"
-
 # Discord
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "cache", "chrono", "rustls_backend"] }
 async-trait = "0.1"
@@ -126,6 +122,13 @@ semver = "1"
 # Skill installation
 zip = "2"
 tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+daemonize = "0.5"
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [lints.clippy]
 dbg_macro = "forbid"

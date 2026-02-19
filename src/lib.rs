@@ -4,7 +4,14 @@ pub mod agent;
 pub mod api;
 pub mod config;
 pub mod conversation;
+#[cfg(unix)]
+#[path = "daemon.rs"]
 pub mod daemon;
+
+#[cfg(windows)]
+#[path = "daemon_windows.rs"]
+pub mod daemon;
+
 pub mod db;
 pub mod error;
 pub mod cron;
