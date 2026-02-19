@@ -14,6 +14,7 @@ const PROVIDER_LABELS: Record<string, string> = {
 	anthropic: "Anthropic",
 	openrouter: "OpenRouter",
 	openai: "OpenAI",
+	nvidia: "NVIDIA NIM",
 	deepseek: "DeepSeek",
 	xai: "xAI",
 	mistral: "Mistral",
@@ -110,7 +111,7 @@ export function ModelSelect({ label, description, value, onChange }: ModelSelect
 	};
 
 	const providerOrder = [
-		"openrouter", "anthropic", "openai", "deepseek", "xai", "mistral",
+		"openrouter", "anthropic", "openai", "nvidia", "deepseek", "xai", "mistral",
 		"groq", "together", "fireworks", "zhipu", "opencode-zen",
 	];
 	const sortedProviders = Object.keys(grouped).sort(

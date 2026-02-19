@@ -2711,6 +2711,7 @@ async fn cancel_process(
 struct ProviderStatus {
     anthropic: bool,
     openai: bool,
+    nvidia: bool,
     openrouter: bool,
     zhipu: bool,
     groq: bool,
@@ -2749,6 +2750,7 @@ async fn get_providers(
     let (
         anthropic,
         openai,
+        nvidia,
         openrouter,
         zhipu,
         groq,
@@ -2786,6 +2788,7 @@ async fn get_providers(
         (
             has_key("anthropic_key", "ANTHROPIC_API_KEY"),
             has_key("openai_key", "OPENAI_API_KEY"),
+            has_key("nvidia_key", "NVIDIA_API_KEY"),
             has_key("openrouter_key", "OPENROUTER_API_KEY"),
             has_key("zhipu_key", "ZHIPU_API_KEY"),
             has_key("groq_key", "GROQ_API_KEY"),
@@ -2801,6 +2804,7 @@ async fn get_providers(
         (
             std::env::var("ANTHROPIC_API_KEY").is_ok(),
             std::env::var("OPENAI_API_KEY").is_ok(),
+            std::env::var("NVIDIA_API_KEY").is_ok(),
             std::env::var("OPENROUTER_API_KEY").is_ok(),
             std::env::var("ZHIPU_API_KEY").is_ok(),
             std::env::var("GROQ_API_KEY").is_ok(),
@@ -2816,6 +2820,7 @@ async fn get_providers(
     let providers = ProviderStatus {
         anthropic,
         openai,
+        nvidia,
         openrouter,
         zhipu,
         groq,
@@ -2828,6 +2833,7 @@ async fn get_providers(
     };
     let has_any = providers.anthropic
         || providers.openai
+        || providers.nvidia
         || providers.openrouter
         || providers.zhipu
         || providers.groq
@@ -2848,6 +2854,7 @@ async fn update_provider(
     let key_name = match request.provider.as_str() {
         "anthropic" => "anthropic_key",
         "openai" => "openai_key",
+        "nvidia" => "nvidia_key",
         "openrouter" => "openrouter_key",
         "zhipu" => "zhipu_key",
         "groq" => "groq_key",
@@ -2928,6 +2935,7 @@ async fn update_provider(
         let has_key_for_current = match current_provider {
             "anthropic" => has_provider_key("anthropic_key", "ANTHROPIC_API_KEY"),
             "openai" => has_provider_key("openai_key", "OPENAI_API_KEY"),
+            "nvidia" => has_provider_key("nvidia_key", "NVIDIA_API_KEY"),
             "openrouter" => has_provider_key("openrouter_key", "OPENROUTER_API_KEY"),
             "zhipu" => has_provider_key("zhipu_key", "ZHIPU_API_KEY"),
             "groq" => has_provider_key("groq_key", "GROQ_API_KEY"),
@@ -3002,6 +3010,7 @@ async fn delete_provider(
     let key_name = match provider.as_str() {
         "anthropic" => "anthropic_key",
         "openai" => "openai_key",
+        "nvidia" => "nvidia_key",
         "openrouter" => "openrouter_key",
         "zhipu" => "zhipu_key",
         "groq" => "groq_key",
@@ -3082,6 +3091,7 @@ fn direct_provider_mapping(models_dev_id: &str) -> Option<&'static str> {
     match models_dev_id {
         "anthropic" => Some("anthropic"),
         "openai" => Some("openai"),
+        "nvidia" => Some("nvidia"),
         "deepseek" => Some("deepseek"),
         "xai" => Some("xai"),
         "mistral" => Some("mistral"),
@@ -3363,6 +3373,9 @@ async fn configured_providers(config_path: &std::path::Path) -> Vec<&'static str
     }
     if has_key("openai_key", "OPENAI_API_KEY") {
         providers.push("openai");
+    }
+    if has_key("nvidia_key", "NVIDIA_API_KEY") {
+        providers.push("nvidia");
     }
     if has_key("openrouter_key", "OPENROUTER_API_KEY") {
         providers.push("openrouter");

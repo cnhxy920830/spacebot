@@ -96,6 +96,14 @@ const PROVIDERS = [
 		defaultModel: "gpt-4.1",
 	},
 	{
+		id: "nvidia",
+		name: "NVIDIA NIM",
+		description: "NVIDIA-hosted and NIM-compatible models",
+		placeholder: "nvapi-...",
+		envVar: "NVIDIA_API_KEY",
+		defaultModel: "meta/llama-3.1-70b-instruct",
+	},
+	{
 		id: "zhipu",
 		name: "Z.ai (GLM)",
 		description: "GLM models (GLM-4, GLM-4-Flash)",

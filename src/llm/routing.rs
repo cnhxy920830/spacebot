@@ -131,6 +131,7 @@ pub fn defaults_for_provider(provider: &str) -> RoutingConfig {
             RoutingConfig::for_model("openrouter/anthropic/claude-sonnet-4-20250514".into())
         }
         "openai" => RoutingConfig::for_model("openai/gpt-4.1".into()),
+        "nvidia" => RoutingConfig::for_model("nvidia/meta/llama-3.1-70b-instruct".into()),
         "zhipu" => RoutingConfig::for_model("zhipu/glm-4-plus".into()),
         "groq" => RoutingConfig::for_model("groq/llama-3.3-70b-versatile".into()),
         "together" => RoutingConfig::for_model(
@@ -152,6 +153,7 @@ pub fn provider_to_prefix(provider: &str) -> &str {
     match provider {
         "openrouter" => "openrouter/",
         "openai" => "openai/",
+        "nvidia" => "nvidia/",
         "anthropic" => "anthropic/",
         "zhipu" => "zhipu/",
         "groq" => "groq/",

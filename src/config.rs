@@ -79,6 +79,7 @@ pub struct LlmConfig {
     ///
     /// The runtime appends `/chat/completions` when only a base path is provided.
     pub openai_base_url: Option<String>,
+    pub nvidia_key: Option<String>,
     pub openrouter_key: Option<String>,
     pub zhipu_key: Option<String>,
     pub groq_key: Option<String>,
@@ -95,6 +96,7 @@ impl LlmConfig {
     pub fn has_any_key(&self) -> bool {
         self.anthropic_key.is_some()
             || self.openai_key.is_some()
+            || self.nvidia_key.is_some()
             || self.openrouter_key.is_some()
             || self.zhipu_key.is_some()
             || self.groq_key.is_some()
@@ -906,6 +908,7 @@ struct TomlLlmConfig {
     anthropic_key: Option<String>,
     openai_key: Option<String>,
     openai_base_url: Option<String>,
+    nvidia_key: Option<String>,
     openrouter_key: Option<String>,
     zhipu_key: Option<String>,
     groq_key: Option<String>,
@@ -1257,6 +1260,7 @@ impl Config {
             openai_base_url: std::env::var("OPENAI_BASE_URL")
                 .ok()
                 .or_else(|| std::env::var("OPENAI_API_BASE").ok()),
+            nvidia_key: std::env::var("NVIDIA_API_KEY").ok(),
             openrouter_key: std::env::var("OPENROUTER_API_KEY").ok(),
             zhipu_key: std::env::var("ZHIPU_API_KEY").ok(),
             groq_key: std::env::var("GROQ_API_KEY").ok(),
@@ -1350,6 +1354,12 @@ impl Config {
                 .and_then(resolve_env_value)
                 .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
                 .or_else(|| std::env::var("OPENAI_API_BASE").ok()),
+            nvidia_key: toml
+                .llm
+                .nvidia_key
+                .as_deref()
+                .and_then(resolve_env_value)
+                .or_else(|| std::env::var("NVIDIA_API_KEY").ok()),
             openrouter_key: toml
                 .llm
                 .openrouter_key
@@ -2363,6 +2373,7 @@ pub fn run_onboarding() -> anyhow::Result<Option<PathBuf>> {
         "Anthropic",
         "OpenRouter",
         "OpenAI",
+        "NVIDIA NIM",
         "Z.ai (GLM)",
         "Groq",
         "Together AI",
@@ -2382,14 +2393,15 @@ pub fn run_onboarding() -> anyhow::Result<Option<PathBuf>> {
         0 => ("Anthropic API key", "anthropic_key", "anthropic"),
         1 => ("OpenRouter API key", "openrouter_key", "openrouter"),
         2 => ("OpenAI API key", "openai_key", "openai"),
-        3 => ("Z.ai (GLM) API key", "zhipu_key", "zhipu"),
-        4 => ("Groq API key", "groq_key", "groq"),
-        5 => ("Together AI API key", "together_key", "together"),
-        6 => ("Fireworks AI API key", "fireworks_key", "fireworks"),
-        7 => ("DeepSeek API key", "deepseek_key", "deepseek"),
-        8 => ("xAI API key", "xai_key", "xai"),
-        9 => ("Mistral AI API key", "mistral_key", "mistral"),
-        10 => ("OpenCode Zen API key", "opencode_zen_key", "opencode-zen"),
+        3 => ("NVIDIA API key", "nvidia_key", "nvidia"),
+        4 => ("Z.ai (GLM) API key", "zhipu_key", "zhipu"),
+        5 => ("Groq API key", "groq_key", "groq"),
+        6 => ("Together AI API key", "together_key", "together"),
+        7 => ("Fireworks AI API key", "fireworks_key", "fireworks"),
+        8 => ("DeepSeek API key", "deepseek_key", "deepseek"),
+        9 => ("xAI API key", "xai_key", "xai"),
+        10 => ("Mistral AI API key", "mistral_key", "mistral"),
+        11 => ("OpenCode Zen API key", "opencode_zen_key", "opencode-zen"),
         _ => unreachable!(),
     };
 

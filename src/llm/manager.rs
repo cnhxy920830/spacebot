@@ -50,6 +50,11 @@ impl LlmManager {
                 .openai_key
                 .clone()
                 .ok_or_else(|| LlmError::MissingProviderKey("openai".into()).into()),
+            "nvidia" => self
+                .config
+                .nvidia_key
+                .clone()
+                .ok_or_else(|| LlmError::MissingProviderKey("nvidia".into()).into()),
             "openrouter" => self
                 .config
                 .openrouter_key

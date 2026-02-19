@@ -72,6 +72,7 @@ impl SpacebotModel {
         match self.provider.as_str() {
             "anthropic" => self.call_anthropic(request).await,
             "openai" => self.call_openai(request).await,
+            "nvidia" => self.call_nvidia(request).await,
             "openrouter" => self.call_openrouter(request).await,
             "zhipu" => self.call_zhipu(request).await,
             "groq" => self.call_groq(request).await,
@@ -723,6 +724,19 @@ impl SpacebotModel {
             "opencode-zen",
             "OpenCode Zen",
             "https://opencode.ai/zen/v1/chat/completions",
+        )
+        .await
+    }
+
+    async fn call_nvidia(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+        self.call_openai_compatible(
+            request,
+            "nvidia",
+            "NVIDIA",
+            "https://integrate.api.nvidia.com/v1/chat/completions",
         )
         .await
     }

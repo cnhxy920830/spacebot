@@ -17,6 +17,10 @@ pub async fn init_providers(config: &LlmConfig) -> Result<()> {
         tracing::info!("OpenAI provider configured");
     }
 
+    if config.nvidia_key.is_some() {
+        tracing::info!("NVIDIA provider configured");
+    }
+
     if config.opencode_zen_key.is_some() {
         tracing::info!("OpenCode Zen provider configured");
     }

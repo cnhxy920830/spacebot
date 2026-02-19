@@ -645,6 +645,7 @@ export interface CronExecutionsParams {
 export interface ProviderStatus {
 	anthropic: boolean;
 	openai: boolean;
+	nvidia: boolean;
 	openrouter: boolean;
 	zhipu: boolean;
 	groq: boolean;

@@ -59,6 +59,7 @@ export function ProviderIcon({ provider, className = "text-ink-faint", size = 24
 	const iconMap: Record<string, React.ComponentType<IconProps>> = {
 		anthropic: Anthropic,
 		openai: OpenAI,
+		nvidia: OpenAI,
 		openrouter: OpenRouter,
 		groq: Groq,
 		mistral: Mistral,
