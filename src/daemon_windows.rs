@@ -70,7 +70,8 @@ impl DaemonPaths {
     }
 }
 
-/// Check whether a daemon is already running by testing PID file liveness.
+/// Check whether a daemon is already running by testing PID file liveness
+/// and named pipe connectivity.
 pub fn is_running(paths: &DaemonPaths) -> Option<u32> {
     let pid = read_pid_file(&paths.pid_file)?;
 
@@ -79,7 +80,15 @@ pub fn is_running(paths: &DaemonPaths) -> Option<u32> {
         return None;
     }
 
-    // If the process is alive, treat it as running.
+    // Double-check by trying to connect to the named pipe
+    let pipe_name = pipe_name(paths);
+    if let Ok(client) = ClientOptions::new().open(&pipe_name) {
+        drop(client);
+        return Some(pid);
+    }
+
+    // PID alive but can't connect to pipe — process may be starting up or crashed
+    // without cleanup. Trust the PID.
     Some(pid)
 }
 
