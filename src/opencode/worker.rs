@@ -28,7 +28,7 @@ pub struct OpenCodeWorker {
     pub input_rx: Option<mpsc::Receiver<String>>,
     /// System prompt injected into each OpenCode prompt.
     pub system_prompt: Option<String>,
-    /// Model override (provider/model format like "anthropic/claude-sonnet-4-20250514").
+    /// Model override (provider/model format like "anthropic/claude-sonnet-4").
     pub model: Option<String>,
 }
 
@@ -592,7 +592,7 @@ fn extract_sse_event(buffer: &mut String) -> Option<SseEvent> {
     }
 }
 
-/// Parse a model string like "anthropic/claude-sonnet-4-20250514" into a ModelParam.
+/// Parse a model string like "anthropic/claude-sonnet-4" into a ModelParam.
 fn parse_model_param(model: &str) -> Option<ModelParam> {
     let (provider, model_id) = model.split_once('/')?;
     Some(ModelParam {

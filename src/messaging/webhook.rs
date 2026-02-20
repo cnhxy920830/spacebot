@@ -143,6 +143,12 @@ impl Messaging for WebhookAdapter {
                 filename: None,
                 caption: None,
             },
+            OutboundResponse::RichMessage { text, .. } => WebhookResponse {
+                response_type: "text".into(),
+                content: Some(text),
+                filename: None,
+                caption: None,
+            },
             OutboundResponse::ThreadReply { text, .. } => WebhookResponse {
                 response_type: "text".into(),
                 content: Some(text),
@@ -175,8 +181,23 @@ impl Messaging for WebhookAdapter {
                 filename: None,
                 caption: None,
             },
-            // Reactions and status updates aren't meaningful over webhook
-            OutboundResponse::Reaction(_) | OutboundResponse::Status(_) => return Ok(()),
+            // Reactions, status updates, and remove-reaction aren't meaningful over webhook
+            OutboundResponse::Reaction(_)
+            | OutboundResponse::RemoveReaction(_)
+            | OutboundResponse::Status(_) => return Ok(()),
+            // Slack-specific rich variants — fall back to plain text
+            OutboundResponse::Ephemeral { text, .. } => WebhookResponse {
+                response_type: "text".into(),
+                content: Some(text),
+                filename: None,
+                caption: None,
+            },
+            OutboundResponse::ScheduledMessage { text, .. } => WebhookResponse {
+                response_type: "text".into(),
+                content: Some(text),
+                filename: None,
+                caption: None,
+            },
         };
 
         self.response_buffers

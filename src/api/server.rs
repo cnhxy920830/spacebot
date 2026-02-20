@@ -3,7 +3,7 @@
 use super::state::ApiState;
 use super::{
     agents, bindings, channels, config, cortex, cron, ingest, memories, messaging, models,
-    providers, settings, skills, system,
+    providers, settings, skills, system, webchat,
 };
 
 use axum::Router;
@@ -44,7 +44,9 @@ pub async fn start_http_server(
         .route("/events", get(system::events_sse))
         .route(
             "/agents",
-            get(agents::list_agents).post(agents::create_agent),
+            get(agents::list_agents)
+                .post(agents::create_agent)
+                .delete(agents::delete_agent),
         )
         .route("/agents/overview", get(agents::agent_overview))
         .route("/channels", get(channels::list_channels))
@@ -93,6 +95,7 @@ pub async fn start_http_server(
             "/providers",
             get(providers::get_providers).put(providers::update_provider),
         )
+        .route("/providers/test", post(providers::test_provider_model))
         .route("/providers/{provider}", delete(providers::delete_provider))
         .route("/models", get(models::get_models))
         .route("/models/refresh", post(models::refresh_models))
@@ -121,7 +124,9 @@ pub async fn start_http_server(
             "/update/check",
             get(settings::update_check).post(settings::update_check_now),
         )
-        .route("/update/apply", post(settings::update_apply));
+        .route("/update/apply", post(settings::update_apply))
+        .route("/webchat/send", post(webchat::webchat_send))
+        .route("/webchat/history", get(webchat::webchat_history));
 
     let app = Router::new()
         .nest("/api", api_routes)

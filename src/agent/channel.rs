@@ -405,11 +405,23 @@ impl Channel {
                 let server_name = first
                     .metadata
                     .get("discord_guild_name")
-                    .and_then(|v| v.as_str());
+                    .and_then(|v| v.as_str())
+                    .or_else(|| {
+                        first
+                            .metadata
+                            .get("telegram_chat_title")
+                            .and_then(|v| v.as_str())
+                    });
                 let channel_name = first
                     .metadata
                     .get("discord_channel_name")
-                    .and_then(|v| v.as_str());
+                    .and_then(|v| v.as_str())
+                    .or_else(|| {
+                        first
+                            .metadata
+                            .get("telegram_chat_type")
+                            .and_then(|v| v.as_str())
+                    });
                 self.conversation_context = Some(
                     prompt_engine
                         .render_conversation_context(&first.source, server_name, channel_name)
@@ -434,6 +446,10 @@ impl Channel {
                     crate::MessageContent::Text(text) => (text.clone(), Vec::new()),
                     crate::MessageContent::Media { text, attachments } => {
                         (text.clone().unwrap_or_default(), attachments.clone())
+                    }
+                    // Render interactions as their Display form so the LLM sees plain text.
+                    crate::MessageContent::Interaction { .. } => {
+                        (message.content.to_string(), Vec::new())
                     }
                 };
 
@@ -601,6 +617,8 @@ impl Channel {
             crate::MessageContent::Media { text, attachments } => {
                 (text.clone().unwrap_or_default(), attachments.clone())
             }
+            // Render interactions as their Display form so the LLM sees plain text.
+            crate::MessageContent::Interaction { .. } => (message.content.to_string(), Vec::new()),
         };
 
         let user_text = format_user_message(&raw_text, &message);
@@ -636,11 +654,23 @@ impl Channel {
             let server_name = message
                 .metadata
                 .get("discord_guild_name")
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    message
+                        .metadata
+                        .get("telegram_chat_title")
+                        .and_then(|v| v.as_str())
+                });
             let channel_name = message
                 .metadata
                 .get("discord_channel_name")
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    message
+                        .metadata
+                        .get("telegram_chat_type")
+                        .and_then(|v| v.as_str())
+                });
             self.conversation_context = Some(
                 prompt_engine
                     .render_conversation_context(&message.source, server_name, channel_name)
@@ -1643,6 +1673,9 @@ async fn download_attachments(
             download_image_attachment(http, attachment).await
         } else if is_text {
             download_text_attachment(http, attachment).await
+        } else if attachment.mime_type.starts_with("audio/") {
+            // Download audio files to /tmp and provide the path
+            download_audio_attachment(http, attachment).await
         } else {
             let size_str = attachment
                 .size_bytes
@@ -1699,6 +1732,53 @@ async fn download_image_attachment(
     );
 
     UserContent::image_base64(base64_data, media_type, None)
+}
+
+/// Download an audio attachment, save to /tmp, and return the file path for tool use.
+async fn download_audio_attachment(
+    http: &reqwest::Client,
+    attachment: &crate::Attachment,
+) -> UserContent {
+    let response = match http.get(&attachment.url).send().await {
+        Ok(r) => r,
+        Err(error) => {
+            tracing::warn!(%error, filename = %attachment.filename, "failed to download audio");
+            return UserContent::text(format!(
+                "[Failed to download audio: {}]",
+                attachment.filename
+            ));
+        }
+    };
+
+    let bytes = match response.bytes().await {
+        Ok(b) => b,
+        Err(error) => {
+            tracing::warn!(%error, filename = %attachment.filename, "failed to read audio bytes");
+            return UserContent::text(format!(
+                "[Failed to download audio: {}]",
+                attachment.filename
+            ));
+        }
+    };
+
+    let ext = attachment.filename.rsplit('.').next().unwrap_or("ogg");
+    let tmp_path = format!("/tmp/spacebot_audio_{}.{}", uuid::Uuid::new_v4(), ext);
+    if let Err(error) = tokio::fs::write(&tmp_path, &bytes).await {
+        tracing::warn!(%error, "failed to save audio to disk");
+        return UserContent::text(format!("[Failed to save audio: {}]", attachment.filename));
+    }
+
+    tracing::info!(
+        filename = %attachment.filename,
+        path = %tmp_path,
+        size = bytes.len(),
+        "downloaded audio attachment"
+    );
+
+    UserContent::text(format!(
+        "[Voice/audio message saved to: {}] (Use transcribe.sh to transcribe it, then respond to the content)",
+        tmp_path
+    ))
 }
 
 /// Download a text attachment and inline its content for the LLM.

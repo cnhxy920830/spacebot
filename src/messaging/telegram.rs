@@ -128,7 +128,7 @@ impl Messaging for TelegramAdapter {
                         tracing::info!("telegram polling loop shutting down");
                         break;
                     }
-                    result = bot.get_updates().offset(offset).timeout(30).send() => {
+                    result = bot.get_updates().offset(offset).timeout(10).send() => {
                         let updates = match result {
                             Ok(updates) => updates,
                             Err(error) => {
@@ -171,10 +171,8 @@ impl Messaging for TelegramAdapter {
                                         continue;
                                     }
                                 }
-                            }
-
-                            // Chat filter: if configured, only allow listed chats
-                            if let Some(filter) = &permissions.chat_filter {
+                            } else if let Some(filter) = &permissions.chat_filter {
+                                // Chat filter: if configured, only allow listed group/channel chats
                                 if !filter.contains(&chat_id) {
                                     continue;
                                 }
@@ -237,6 +235,17 @@ impl Messaging for TelegramAdapter {
 
         match response {
             OutboundResponse::Text(text) => {
+                self.stop_typing(&message.conversation_id).await;
+
+                for chunk in split_message(&text, MAX_MESSAGE_LENGTH) {
+                    self.bot
+                        .send_message(chat_id, &chunk)
+                        .send()
+                        .await
+                        .context("failed to send telegram message")?;
+                }
+            }
+            OutboundResponse::RichMessage { text, .. } => {
                 self.stop_typing(&message.conversation_id).await;
 
                 for chunk in split_message(&text, MAX_MESSAGE_LENGTH) {
@@ -361,6 +370,24 @@ impl Messaging for TelegramAdapter {
             OutboundResponse::Status(status) => {
                 self.send_status(message, status).await?;
             }
+            // Slack-specific variants — graceful fallbacks for Telegram
+            OutboundResponse::RemoveReaction(_) => {} // no-op
+            OutboundResponse::Ephemeral { text, .. } => {
+                // Telegram has no ephemeral messages — send as regular text
+                let chat_id = self.extract_chat_id(message)?;
+                self.bot
+                    .send_message(chat_id, text)
+                    .await
+                    .context("failed to send ephemeral fallback on telegram")?;
+            }
+            OutboundResponse::ScheduledMessage { text, .. } => {
+                // Telegram has no scheduled messages — send immediately
+                let chat_id = self.extract_chat_id(message)?;
+                self.bot
+                    .send_message(chat_id, text)
+                    .await
+                    .context("failed to send scheduled message fallback on telegram")?;
+            }
         }
 
         Ok(())
@@ -414,6 +441,14 @@ impl Messaging for TelegramAdapter {
         );
 
         if let OutboundResponse::Text(text) = response {
+            for chunk in split_message(&text, MAX_MESSAGE_LENGTH) {
+                self.bot
+                    .send_message(chat_id, &chunk)
+                    .send()
+                    .await
+                    .context("failed to broadcast telegram message")?;
+            }
+        } else if let OutboundResponse::RichMessage { text, .. } = response {
             for chunk in split_message(&text, MAX_MESSAGE_LENGTH) {
                 self.bot
                     .send_message(chat_id, &chunk)

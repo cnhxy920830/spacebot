@@ -4,6 +4,8 @@ pub mod agent;
 pub mod api;
 pub mod config;
 pub mod conversation;
+pub mod cron;
+
 #[cfg(unix)]
 #[path = "daemon.rs"]
 pub mod daemon;
@@ -12,7 +14,6 @@ pub mod daemon;
 #[path = "daemon_windows.rs"]
 pub mod daemon;
 
-pub mod cron;
 pub mod db;
 pub mod error;
 pub mod hooks;
@@ -237,6 +238,23 @@ pub enum MessageContent {
         text: Option<String>,
         attachments: Vec<Attachment>,
     },
+    /// A platform interactive component was actioned (button click, select menu, etc.).
+    ///
+    /// Produced by Slack and Discord adapters. The agent can correlate the interaction
+    /// back to the original message via `message_ts` (Slack) or `message_id` (Discord).
+    Interaction {
+        /// Unique identifier for the interactive element (`action_id` on Slack, `custom_id` on Discord).
+        action_id: String,
+        /// Block/container ID (Slack `block_id`, Discord component row if needed).
+        block_id: Option<String>,
+        /// The value submitted — button `value`, or selected option value(s).
+        /// Single value for buttons, multiple for multi-select menus.
+        values: Vec<String>,
+        /// Human-readable label of the selected option (select menus only).
+        label: Option<String>,
+        /// Platform-specific message reference (`ts` on Slack, message ID on Discord).
+        message_ts: Option<String>,
+    },
 }
 
 impl std::fmt::Display for MessageContent {
@@ -248,6 +266,20 @@ impl std::fmt::Display for MessageContent {
                     write!(f, "{}", t)
                 } else {
                     write!(f, "[media]")
+                }
+            }
+            MessageContent::Interaction {
+                action_id,
+                values,
+                label,
+                ..
+            } => {
+                if let Some(l) = label {
+                    write!(f, "[interaction: {} → {}]", action_id, l)
+                } else if !values.is_empty() {
+                    write!(f, "[interaction: {} → {:?}]", action_id, values)
+                } else {
+                    write!(f, "[interaction: {}]", action_id)
                 }
             }
         }
@@ -284,10 +316,132 @@ pub enum OutboundResponse {
     },
     /// Add a reaction emoji to the triggering message.
     Reaction(String),
+    /// Remove a reaction emoji from the triggering message.
+    /// No-op on platforms that don't support reaction removal.
+    RemoveReaction(String),
+    /// Send a message visible only to the triggering user (ephemeral).
+    /// Falls back to a regular `Text` message on platforms that don't support it.
+    Ephemeral {
+        /// The message text (mrkdwn on Slack, plain text on others).
+        text: String,
+        /// The user ID who should see the message. Required on Slack; ignored elsewhere.
+        user_id: String,
+    },
+    /// Send a rich message with platform-specific formatting.
+    /// - Slack: uses `blocks` if present, falls back to `text`
+    /// - Discord: uses `cards`, `interactive_elements`, `poll` if present, falls back to `text`
+    /// - Other adapters: use `text` as-is
+    RichMessage {
+        /// Plain-text fallback — always present, used for notifications and adapters
+        /// that don't support rich formatting.
+        text: String,
+        /// Slack Block Kit blocks. Serialised as raw JSON so callers don't need to depend
+        /// on slack-morphism types. The Slack adapter deserialises these at send time.
+        #[serde(default)]
+        blocks: Vec<serde_json::Value>,
+        /// Structured cards (maps to Discord Embeds). Ignored by Slack if blocks are present.
+        #[serde(default)]
+        cards: Vec<Card>,
+        /// Interactive elements (buttons, select menus). Maps to Discord ActionRows.
+        #[serde(default)]
+        interactive_elements: Vec<InteractiveElements>,
+        /// An optional poll (Discord only).
+        #[serde(default)]
+        poll: Option<Poll>,
+    },
+    /// Schedule a message to be posted at a future Unix timestamp (Slack only).
+    /// Other adapters send immediately as a regular `Text` message.
+    ScheduledMessage {
+        text: String,
+        /// Unix epoch seconds when the message should be delivered.
+        post_at: i64,
+    },
     StreamStart,
     StreamChunk(String),
     StreamEnd,
     Status(StatusUpdate),
+}
+
+/// A generic rich-formatted card (maps to Embeds in Discord).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema)]
+pub struct Card {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub color: Option<u32>,
+    pub url: Option<String>,
+    #[serde(default)]
+    pub fields: Vec<CardField>,
+    pub footer: Option<String>,
+}
+
+/// A field within a generic Card.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CardField {
+    pub name: String,
+    pub value: String,
+    #[serde(default)]
+    pub inline: bool,
+}
+
+/// Container for interactive elements (maps to ActionRows in Discord).
+/// In Discord, an action row can contain either buttons or a single select menu.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum InteractiveElements {
+    Buttons { buttons: Vec<Button> },
+    Select { select: SelectMenu },
+}
+
+/// A generic interactive button.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Button {
+    pub label: String,
+    pub custom_id: Option<String>,
+    pub style: ButtonStyle,
+    pub url: Option<String>,
+}
+
+/// Styles for interactive buttons.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ButtonStyle {
+    Primary,
+    Secondary,
+    Success,
+    Danger,
+    Link,
+}
+
+/// A select menu option.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SelectOption {
+    pub label: String,
+    pub value: String,
+    pub description: Option<String>,
+    pub emoji: Option<String>,
+}
+
+/// A generic select menu component.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SelectMenu {
+    pub custom_id: String,
+    pub options: Vec<SelectOption>,
+    pub placeholder: Option<String>,
+}
+
+/// A generic poll definition.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Poll {
+    pub question: String,
+    pub answers: Vec<String>,
+    #[serde(default)]
+    pub allow_multiselect: bool,
+    #[serde(default = "default_poll_duration")]
+    pub duration_hours: u32,
+}
+
+fn default_poll_duration() -> u32 {
+    24
 }
 
 /// Serde helper for encoding `Vec<u8>` as base64 in JSON.

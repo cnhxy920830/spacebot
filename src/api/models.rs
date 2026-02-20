@@ -1,7 +1,7 @@
 use super::state::ApiState;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 #[derive(Serialize, Clone)]
 pub(super) struct ModelInfo {
-    /// Full routing string (e.g. "openrouter/anthropic/claude-sonnet-4-20250514")
+    /// Full routing string (e.g. "openrouter/anthropic/claude-sonnet-4")
     id: String,
     /// Human-readable name
     name: String,
@@ -26,6 +26,11 @@ pub(super) struct ModelInfo {
 #[derive(Serialize)]
 pub(super) struct ModelsResponse {
     models: Vec<ModelInfo>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ModelsQuery {
+    provider: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -77,7 +82,6 @@ fn direct_provider_mapping(models_dev_id: &str) -> Option<&'static str> {
     match models_dev_id {
         "anthropic" => Some("anthropic"),
         "openai" => Some("openai"),
-        "nvidia" => Some("nvidia"),
         "deepseek" => Some("deepseek"),
         "xai" => Some("xai"),
         "mistral" => Some("mistral"),
@@ -148,21 +152,57 @@ fn extra_models() -> Vec<ModelInfo> {
             tool_call: true,
             reasoning: false,
         },
+                // Z.AI Coding Plan
         ModelInfo {
-            id: "ollama/gemma3".into(),
-            name: "Gemma 3 (Ollama)".into(),
-            provider: "ollama".into(),
+            id: "zai-coding-plan/glm-4.7".into(),
+            name: "GLM 4.7 (Coding)".into(),
+            provider: "zai-coding-plan".into(),
             context_window: None,
             tool_call: true,
             reasoning: false,
         },
         ModelInfo {
-            id: "ollama/qwen3".into(),
-            name: "Qwen 3 (Ollama)".into(),
-            provider: "ollama".into(),
+            id: "zai-coding-plan/glm-5".into(),
+            name: "GLM 5 (Coding)".into(),
+            provider: "zai-coding-plan".into(),
+            context_window: None,
+            tool_call: true,
+            reasoning: false,
+        },
+        ModelInfo {
+            id: "zai-coding-plan/glm-4.5-air".into(),
+            name: "GLM 4.5 Air (Coding)".into(),
+            provider: "zai-coding-plan".into(),
+            context_window: None,
+            tool_call: true,
+            reasoning: false,
+        },
+        // MiniMax
+        ModelInfo {
+
+            id: "minimax/MiniMax-M1-80k".into(),
+            name: "MiniMax M1 80K".into(),
+            provider: "minimax".into(),
+            context_window: Some(80000),
+            tool_call: true,
+            reasoning: false,
+        },
+        // Moonshot AI (Kimi)
+        ModelInfo {
+            id: "moonshot/kimi-k2.5".into(),
+            name: "Kimi K2.5".into(),
+            provider: "moonshot".into(),
             context_window: None,
             tool_call: true,
             reasoning: true,
+        },
+        ModelInfo {
+            id: "moonshot/moonshot-v1-8k".into(),
+            name: "Moonshot V1 8K".into(),
+            provider: "moonshot".into(),
+            context_window: Some(8000),
+            tool_call: false,
+            reasoning: false,
         },
     ]
 }
@@ -284,9 +324,6 @@ pub(super) async fn configured_providers(config_path: &std::path::Path) -> Vec<&
     if has_key("openai_key", "OPENAI_API_KEY") {
         providers.push("openai");
     }
-    if has_key("nvidia_key", "NVIDIA_API_KEY") {
-        providers.push("nvidia");
-    }
     if has_key("openrouter_key", "OPENROUTER_API_KEY") {
         providers.push("openrouter");
     }
@@ -311,11 +348,17 @@ pub(super) async fn configured_providers(config_path: &std::path::Path) -> Vec<&
     if has_key("mistral_key", "MISTRAL_API_KEY") {
         providers.push("mistral");
     }
-    if has_key("ollama_base_url", "OLLAMA_BASE_URL") || has_key("ollama_key", "OLLAMA_API_KEY") {
-        providers.push("ollama");
-    }
     if has_key("opencode_zen_key", "OPENCODE_ZEN_API_KEY") {
         providers.push("opencode-zen");
+    }
+    if has_key("minimax_key", "MINIMAX_API_KEY") {
+        providers.push("minimax");
+    }
+    if has_key("moonshot_key", "MOONSHOT_API_KEY") {
+        providers.push("moonshot");
+    }
+    if has_key("zai_coding_plan_key", "ZAI_CODING_PLAN_API_KEY") {
+        providers.push("zai-coding-plan");
     }
 
     providers
@@ -323,19 +366,35 @@ pub(super) async fn configured_providers(config_path: &std::path::Path) -> Vec<&
 
 pub(super) async fn get_models(
     State(state): State<Arc<ApiState>>,
+    Query(query): Query<ModelsQuery>,
 ) -> Result<Json<ModelsResponse>, StatusCode> {
     let config_path = state.config_path.read().await.clone();
     let configured = configured_providers(&config_path).await;
+    let requested_provider = query
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty());
 
     let catalog = ensure_models_cache().await;
 
     let mut models: Vec<ModelInfo> = catalog
         .into_iter()
-        .filter(|m| configured.contains(&m.provider.as_str()))
+        .filter(|model| {
+            if let Some(provider) = requested_provider {
+                model.provider == provider
+            } else {
+                configured.contains(&model.provider.as_str())
+            }
+        })
         .collect();
 
     for model in extra_models() {
-        if configured.contains(&model.provider.as_str()) {
+        if let Some(provider) = requested_provider {
+            if model.provider == provider {
+                models.push(model);
+            }
+        } else if configured.contains(&model.provider.as_str()) {
             models.push(model);
         }
     }
@@ -351,5 +410,5 @@ pub(super) async fn refresh_models(
         *cache = (Vec::new(), std::time::Instant::now() - MODELS_CACHE_TTL);
     }
 
-    get_models(State(state)).await
+    get_models(State(state), Query(ModelsQuery { provider: None })).await
 }

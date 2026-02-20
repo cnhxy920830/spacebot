@@ -9,6 +9,8 @@ import Fireworks from "@lobehub/icons/es/Fireworks";
 import Together from "@lobehub/icons/es/Together";
 import XAI from "@lobehub/icons/es/XAI";
 import ZAI from "@lobehub/icons/es/ZAI";
+import Minimax from "@lobehub/icons/es/Minimax";
+import Kimi from "@lobehub/icons/es/Kimi";
 
 interface IconProps {
 	size?: number;
@@ -104,9 +106,12 @@ export function ProviderIcon({ provider, className = "text-ink-faint", size = 24
 		together: Together,
 		xai: XAI,
 		zhipu: ZAI,
+		"zai-coding-plan": ZAI,
 		ollama: OllamaIcon,
 		"opencode-zen": OpenCodeZenIcon,
 		nvidia: NvidiaIcon,
+		minimax: Minimax,
+		moonshot: Kimi, // Kimi is Moonshot AI's product brand
 	};
 
 	const IconComponent = iconMap[provider.toLowerCase()];
