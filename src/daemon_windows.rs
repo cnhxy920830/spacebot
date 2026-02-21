@@ -80,16 +80,38 @@ pub fn is_running(paths: &DaemonPaths) -> Option<u32> {
         return None;
     }
 
-    // Double-check by trying to connect to the named pipe
-    let pipe_name = pipe_name(paths);
-    if let Ok(client) = ClientOptions::new().open(&pipe_name) {
-        drop(client);
-        return Some(pid);
+    // Match Unix behavior:
+    // - if the IPC endpoint marker exists, it must be connectable
+    // - if it's missing, trust the PID (process may still be starting)
+    if paths.socket.exists() {
+        let pipe_name = pipe_name(paths);
+        if can_connect_pipe(&pipe_name) {
+            return Some(pid);
+        }
+
+        cleanup_stale_files(paths);
+        return None;
     }
 
-    // PID alive but can't connect to pipe — process may be starting up or crashed
-    // without cleanup. Trust the PID.
     Some(pid)
+}
+
+/// Synchronously check if we can connect to the named pipe.
+/// Uses std::fs to avoid requiring a Tokio runtime.
+fn can_connect_pipe(pipe_name: &str) -> bool {
+    use std::fs::OpenOptions;
+
+    // On Windows, named pipes can be opened like files
+    // The pipe name format is: \\.\pipe\spacebot-{hash}
+    match OpenOptions::new().read(true).open(pipe_name) {
+        Ok(_) => true,
+        Err(e) => {
+            // ERROR_PIPE_BUSY means the pipe exists but all instances are busy.
+            // Treat this as alive.
+            let raw_os_error = e.raw_os_error().unwrap_or(0);
+            raw_os_error == ERROR_PIPE_BUSY as i32
+        }
+    }
 }
 
 /// Daemonize the current process by spawning a detached child process.
@@ -287,13 +309,21 @@ fn build_otlp_provider(telemetry: &TelemetryConfig) -> Option<SdkTracerProvider>
 pub async fn start_ipc_server(
     paths: &DaemonPaths,
 ) -> anyhow::Result<(watch::Receiver<bool>, tokio::task::JoinHandle<()>)> {
-    if let Some(parent) = paths.pid_file.parent() {
+    if let Some(parent) = paths.socket.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!("failed to create instance directory: {}", parent.display())
         })?;
     }
 
-    write_pid_file(paths, std::process::id())?;
+    // Keep a filesystem marker alongside the PID file so liveness checks can
+    // mirror Unix socket semantics on Windows.
+    if paths.socket.exists() {
+        std::fs::remove_file(&paths.socket)
+            .with_context(|| format!("failed to remove stale socket marker: {}", paths.socket.display()))?;
+    }
+
+    std::fs::write(&paths.socket, b"named-pipe-marker")
+        .with_context(|| format!("failed to create socket marker: {}", paths.socket.display()))?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let start_time = Instant::now();
