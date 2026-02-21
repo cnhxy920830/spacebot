@@ -419,6 +419,9 @@ pub struct AgentConfig {
     pub default: bool,
     /// Custom workspace path. If None, resolved to instance_dir/agents/{id}/workspace.
     pub workspace: Option<PathBuf>,
+    /// Additional directories workers may access via file/shell/exec tools.
+    /// Paths may be absolute or relative to the resolved workspace.
+    pub workspace_allowlist: Option<Vec<PathBuf>>,
     /// Per-agent routing overrides. None inherits from defaults.
     pub routing: Option<RoutingConfig>,
     pub max_concurrent_branches: Option<usize>,
@@ -460,6 +463,7 @@ pub struct CronDef {
 pub struct ResolvedAgentConfig {
     pub id: String,
     pub workspace: PathBuf,
+    pub workspace_allowlist: Vec<PathBuf>,
     pub data_dir: PathBuf,
     pub archives_dir: PathBuf,
     pub routing: RoutingConfig,
@@ -508,13 +512,16 @@ impl AgentConfig {
     /// Resolve this agent config against instance defaults and base paths.
     pub fn resolve(&self, instance_dir: &Path, defaults: &DefaultsConfig) -> ResolvedAgentConfig {
         let agent_root = instance_dir.join("agents").join(&self.id);
+        let workspace = self
+            .workspace
+            .clone()
+            .unwrap_or_else(|| agent_root.join("workspace"));
+        let workspace_allowlist = self.resolve_workspace_allowlist(&workspace);
 
         ResolvedAgentConfig {
             id: self.id.clone(),
-            workspace: self
-                .workspace
-                .clone()
-                .unwrap_or_else(|| agent_root.join("workspace")),
+            workspace,
+            workspace_allowlist,
             data_dir: agent_root.join("data"),
             archives_dir: agent_root.join("archives"),
             routing: self
@@ -548,6 +555,29 @@ impl AgentConfig {
             history_backfill_count: defaults.history_backfill_count,
             cron: self.cron.clone(),
         }
+    }
+
+    fn resolve_workspace_allowlist(&self, workspace: &Path) -> Vec<PathBuf> {
+        let mut allowlist = vec![workspace.to_path_buf()];
+
+        if let Some(configured_roots) = &self.workspace_allowlist {
+            for configured_root in configured_roots {
+                let resolved_root = if configured_root.is_absolute() {
+                    configured_root.clone()
+                } else {
+                    workspace.join(configured_root)
+                };
+
+                if !allowlist
+                    .iter()
+                    .any(|existing_root| existing_root == &resolved_root)
+                {
+                    allowlist.push(resolved_root);
+                }
+            }
+        }
+
+        allowlist
     }
 }
 
@@ -1378,6 +1408,7 @@ struct TomlAgentConfig {
     #[serde(default)]
     default: bool,
     workspace: Option<String>,
+    workspace_allowlist: Option<Vec<String>>,
     routing: Option<TomlRoutingConfig>,
     max_concurrent_branches: Option<usize>,
     max_concurrent_workers: Option<usize>,
@@ -1825,6 +1856,7 @@ impl Config {
             id: "main".into(),
             default: true,
             workspace: None,
+            workspace_allowlist: None,
             routing: Some(routing),
             max_concurrent_branches: None,
             max_concurrent_workers: None,
@@ -2341,6 +2373,9 @@ impl Config {
                     id: a.id,
                     default: a.default,
                     workspace: a.workspace.map(PathBuf::from),
+                    workspace_allowlist: a
+                        .workspace_allowlist
+                        .map(|roots| roots.into_iter().map(PathBuf::from).collect()),
                     routing: agent_routing,
                     max_concurrent_branches: a.max_concurrent_branches,
                     max_concurrent_workers: a.max_concurrent_workers,
@@ -2440,6 +2475,7 @@ impl Config {
                 id: "main".into(),
                 default: true,
                 workspace: None,
+                workspace_allowlist: None,
                 routing: None,
                 max_concurrent_branches: None,
                 max_concurrent_workers: None,
@@ -2638,6 +2674,8 @@ pub struct RuntimeConfig {
     pub instance_dir: PathBuf,
     /// Agent workspace directory (e.g., ~/.spacebot/agents/{id}/workspace). Immutable after startup.
     pub workspace_dir: PathBuf,
+    /// Directories workers may access through file/shell/exec tools.
+    pub workspace_allowlist: ArcSwap<Vec<PathBuf>>,
     pub routing: ArcSwap<RoutingConfig>,
     pub compaction: ArcSwap<CompactionConfig>,
     pub memory_persistence: ArcSwap<MemoryPersistenceConfig>,
@@ -2689,6 +2727,7 @@ impl RuntimeConfig {
         Self {
             instance_dir: instance_dir.to_path_buf(),
             workspace_dir: agent_config.workspace.clone(),
+            workspace_allowlist: ArcSwap::from_pointee(agent_config.workspace_allowlist.clone()),
             routing: ArcSwap::from_pointee(agent_config.routing.clone()),
             compaction: ArcSwap::from_pointee(agent_config.compaction),
             memory_persistence: ArcSwap::from_pointee(agent_config.memory_persistence),
@@ -2745,6 +2784,8 @@ impl RuntimeConfig {
 
         let resolved = agent.resolve(&config.instance_dir, &config.defaults);
 
+        self.workspace_allowlist
+            .store(Arc::new(resolved.workspace_allowlist));
         self.routing.store(Arc::new(resolved.routing));
         self.compaction.store(Arc::new(resolved.compaction));
         self.memory_persistence

@@ -193,6 +193,12 @@ impl Worker {
             self.screenshot_dir.clone(),
             self.brave_search_key.clone(),
             self.deps.runtime_config.workspace_dir.clone(),
+            self.deps
+                .runtime_config
+                .workspace_allowlist
+                .load()
+                .as_ref()
+                .clone(),
             self.deps.runtime_config.instance_dir.clone(),
         );
 

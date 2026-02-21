@@ -4,6 +4,7 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Serialize, Debug)]
@@ -67,6 +68,12 @@ pub(super) struct BrowserSection {
 }
 
 #[derive(Serialize, Debug)]
+pub(super) struct WorkspaceSection {
+    workspace: String,
+    workspace_allowlist: Vec<String>,
+}
+
+#[derive(Serialize, Debug)]
 pub(super) struct DiscordSection {
     enabled: bool,
     allow_bot_messages: bool,
@@ -76,6 +83,7 @@ pub(super) struct DiscordSection {
 pub(super) struct AgentConfigResponse {
     routing: RoutingSection,
     tuning: TuningSection,
+    workspace: WorkspaceSection,
     compaction: CompactionSection,
     cortex: CortexSection,
     coalesce: CoalesceSection,
@@ -89,6 +97,26 @@ pub(super) struct AgentConfigQuery {
     agent_id: String,
 }
 
+#[derive(Deserialize)]
+pub(super) struct BrowseDirectoriesQuery {
+    agent_id: String,
+    path: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+pub(super) struct DirectoryEntry {
+    name: String,
+    path: String,
+}
+
+#[derive(Serialize, Debug)]
+pub(super) struct BrowseDirectoriesResponse {
+    current_path: String,
+    parent_path: Option<String>,
+    roots: Vec<String>,
+    directories: Vec<DirectoryEntry>,
+}
+
 #[derive(Deserialize, Debug, Default)]
 pub(super) struct AgentConfigUpdateRequest {
     agent_id: String,
@@ -96,6 +124,8 @@ pub(super) struct AgentConfigUpdateRequest {
     routing: Option<RoutingUpdate>,
     #[serde(default)]
     tuning: Option<TuningUpdate>,
+    #[serde(default)]
+    workspace: Option<WorkspaceUpdate>,
     #[serde(default)]
     compaction: Option<CompactionUpdate>,
     #[serde(default)]
@@ -128,6 +158,11 @@ pub(super) struct TuningUpdate {
     branch_max_turns: Option<usize>,
     context_window: Option<usize>,
     history_backfill_count: Option<usize>,
+}
+
+#[derive(Deserialize, Debug)]
+pub(super) struct WorkspaceUpdate {
+    workspace_allowlist: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -192,6 +227,7 @@ pub(super) async fn get_agent_config(
     let coalesce = rc.coalesce.load();
     let memory_persistence = rc.memory_persistence.load();
     let browser = rc.browser_config.load();
+    let workspace_allowlist = rc.workspace_allowlist.load();
 
     let response = AgentConfigResponse {
         routing: RoutingSection {
@@ -209,6 +245,13 @@ pub(super) async fn get_agent_config(
             branch_max_turns: **rc.branch_max_turns.load(),
             context_window: **rc.context_window.load(),
             history_backfill_count: **rc.history_backfill_count.load(),
+        },
+        workspace: WorkspaceSection {
+            workspace: rc.workspace_dir.display().to_string(),
+            workspace_allowlist: workspace_allowlist
+                .iter()
+                .map(|path| display_path(path))
+                .collect(),
         },
         compaction: CompactionSection {
             background_threshold: compaction.background_threshold,
@@ -261,6 +304,27 @@ pub(super) async fn get_agent_config(
     Ok(Json(response))
 }
 
+pub(super) async fn browse_directories(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<BrowseDirectoriesQuery>,
+) -> Result<Json<BrowseDirectoriesResponse>, StatusCode> {
+    let runtime_configs = state.runtime_configs.load();
+    let runtime_config = runtime_configs
+        .get(&query.agent_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let requested_path = query
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime_config.workspace_dir.clone());
+
+    let response = list_directories_for_path(requested_path)?;
+    Ok(Json(response))
+}
+
 /// Update agent configuration by editing config.toml with toml_edit.
 /// This preserves formatting and comments while writing the new values.
 pub(super) async fn update_agent_config(
@@ -294,6 +358,9 @@ pub(super) async fn update_agent_config(
     }
     if let Some(tuning) = &request.tuning {
         update_tuning_table(&mut doc, agent_idx, tuning)?;
+    }
+    if let Some(workspace) = &request.workspace {
+        update_workspace_table(&mut doc, agent_idx, workspace)?;
     }
     if let Some(compaction) = &request.compaction {
         update_compaction_table(&mut doc, agent_idx, compaction)?;
@@ -354,6 +421,113 @@ pub(super) async fn update_agent_config(
         }),
     )
     .await
+}
+
+fn list_directories_for_path(path: PathBuf) -> Result<BrowseDirectoriesResponse, StatusCode> {
+    let canonical_path = path.canonicalize().map_err(map_directory_error)?;
+    if !canonical_path.is_dir() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let read_dir = std::fs::read_dir(&canonical_path).map_err(map_directory_error)?;
+
+    let mut directories = Vec::new();
+    for entry_result in read_dir {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let path = entry.path();
+        let canonical_child = path.canonicalize().unwrap_or(path);
+
+        directories.push(DirectoryEntry {
+            name: entry.file_name().to_string_lossy().to_string(),
+            path: display_path(&canonical_child),
+        });
+    }
+
+    directories.sort_by_cached_key(|directory| directory.name.to_ascii_lowercase());
+
+    Ok(BrowseDirectoriesResponse {
+        current_path: display_path(&canonical_path),
+        parent_path: canonical_path.parent().map(display_path),
+        roots: filesystem_roots(&canonical_path)
+            .into_iter()
+            .map(|path| display_path(&path))
+            .collect(),
+        directories,
+    })
+}
+
+fn display_path(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        let raw = path.display().to_string();
+
+        if let Some(stripped) = raw.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{stripped}");
+        }
+
+        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+            return stripped.to_string();
+        }
+
+        raw
+    }
+
+    #[cfg(not(windows))]
+    {
+        path.display().to_string()
+    }
+}
+
+fn map_directory_error(error: std::io::Error) -> StatusCode {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+        std::io::ErrorKind::NotFound => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+#[cfg(windows)]
+fn filesystem_roots(current_path: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    for drive_letter in b'A'..=b'Z' {
+        let candidate = format!("{}:\\", char::from(drive_letter));
+        let candidate_path = PathBuf::from(candidate);
+        if candidate_path.exists() {
+            roots.push(candidate_path);
+        }
+    }
+
+    if roots.is_empty() {
+        if let Some(parent) = current_path.ancestors().last() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+
+    roots
+}
+
+#[cfg(unix)]
+fn filesystem_roots(_current_path: &Path) -> Vec<PathBuf> {
+    vec![PathBuf::from("/")]
+}
+
+#[cfg(not(any(unix, windows)))]
+fn filesystem_roots(current_path: &Path) -> Vec<PathBuf> {
+    vec![current_path.to_path_buf()]
 }
 
 // -- TOML edit helpers --
@@ -460,6 +634,42 @@ fn update_tuning_table(
         agent["history_backfill_count"] = toml_edit::value(v as i64);
     }
     Ok(())
+}
+
+fn update_workspace_table(
+    doc: &mut toml_edit::DocumentMut,
+    agent_idx: usize,
+    workspace: &WorkspaceUpdate,
+) -> Result<(), StatusCode> {
+    let agent = get_agent_table_mut(doc, agent_idx)?;
+
+    if let Some(allowlist) = &workspace.workspace_allowlist {
+        let mut array = toml_edit::Array::new();
+        for raw_path in allowlist {
+            let trimmed = raw_path.trim();
+            if !trimmed.is_empty() {
+                array.push(normalize_workspace_path(trimmed));
+            }
+        }
+        agent["workspace_allowlist"] = toml_edit::Item::Value(toml_edit::Value::Array(array));
+    }
+
+    Ok(())
+}
+
+fn normalize_workspace_path(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(stripped) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{stripped}");
+        }
+
+        if let Some(stripped) = path.strip_prefix(r"\\?\") {
+            return stripped.to_string();
+        }
+    }
+
+    path.to_string()
 }
 
 fn update_compaction_table(

@@ -318,8 +318,12 @@ pub async fn start_ipc_server(
     // Keep a filesystem marker alongside the PID file so liveness checks can
     // mirror Unix socket semantics on Windows.
     if paths.socket.exists() {
-        std::fs::remove_file(&paths.socket)
-            .with_context(|| format!("failed to remove stale socket marker: {}", paths.socket.display()))?;
+        std::fs::remove_file(&paths.socket).with_context(|| {
+            format!(
+                "failed to remove stale socket marker: {}",
+                paths.socket.display()
+            )
+        })?;
     }
 
     std::fs::write(&paths.socket, b"named-pipe-marker")

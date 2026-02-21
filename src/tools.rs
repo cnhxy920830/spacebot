@@ -211,8 +211,9 @@ pub fn create_branch_tool_server(
 /// the specific worker's ID so status updates route correctly. The browser tool
 /// is included when browser automation is enabled in the agent config.
 ///
-/// File operations are restricted to `workspace`. Shell and exec commands are
-/// blocked from accessing sensitive files in `instance_dir`.
+/// File operations are restricted to `workspace` plus configured allowlist
+/// roots. Shell and exec commands are blocked from accessing sensitive files
+/// in `instance_dir`.
 pub fn create_worker_tool_server(
     agent_id: AgentId,
     worker_id: WorkerId,
@@ -222,12 +223,20 @@ pub fn create_worker_tool_server(
     screenshot_dir: PathBuf,
     brave_search_key: Option<String>,
     workspace: PathBuf,
+    workspace_allowlist: Vec<PathBuf>,
     instance_dir: PathBuf,
 ) -> ToolServerHandle {
     let mut server = ToolServer::new()
-        .tool(ShellTool::new(instance_dir.clone(), workspace.clone()))
-        .tool(FileTool::new(workspace.clone()))
-        .tool(ExecTool::new(instance_dir, workspace))
+        .tool(ShellTool::new(
+            instance_dir.clone(),
+            workspace.clone(),
+            workspace_allowlist.clone(),
+        ))
+        .tool(FileTool::new(
+            workspace.clone(),
+            workspace_allowlist.clone(),
+        ))
+        .tool(ExecTool::new(instance_dir, workspace, workspace_allowlist))
         .tool(SetStatusTool::new(
             agent_id, worker_id, channel_id, event_tx,
         ));
@@ -266,6 +275,7 @@ pub fn create_cortex_chat_tool_server(
     screenshot_dir: PathBuf,
     brave_search_key: Option<String>,
     workspace: PathBuf,
+    workspace_allowlist: Vec<PathBuf>,
     instance_dir: PathBuf,
 ) -> ToolServerHandle {
     let mut server = ToolServer::new()
@@ -273,9 +283,16 @@ pub fn create_cortex_chat_tool_server(
         .tool(MemoryRecallTool::new(memory_search.clone()))
         .tool(MemoryDeleteTool::new(memory_search))
         .tool(ChannelRecallTool::new(conversation_logger, channel_store))
-        .tool(ShellTool::new(instance_dir.clone(), workspace.clone()))
-        .tool(FileTool::new(workspace.clone()))
-        .tool(ExecTool::new(instance_dir, workspace));
+        .tool(ShellTool::new(
+            instance_dir.clone(),
+            workspace.clone(),
+            workspace_allowlist.clone(),
+        ))
+        .tool(FileTool::new(
+            workspace.clone(),
+            workspace_allowlist.clone(),
+        ))
+        .tool(ExecTool::new(instance_dir, workspace, workspace_allowlist));
 
     if browser_config.enabled {
         server = server.tool(BrowserTool::new(browser_config, screenshot_dir));

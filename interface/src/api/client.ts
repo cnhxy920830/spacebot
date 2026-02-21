@@ -479,6 +479,11 @@ export interface TuningSection {
 	history_backfill_count: number;
 }
 
+export interface WorkspaceSection {
+	workspace: string;
+	workspace_allowlist: string[];
+}
+
 export interface CompactionSection {
 	background_threshold: number;
 	aggressive_threshold: number;
@@ -522,12 +527,25 @@ export interface DiscordSection {
 export interface AgentConfigResponse {
 	routing: RoutingSection;
 	tuning: TuningSection;
+	workspace: WorkspaceSection;
 	compaction: CompactionSection;
 	cortex: CortexSection;
 	coalesce: CoalesceSection;
 	memory_persistence: MemoryPersistenceSection;
 	browser: BrowserSection;
 	discord: DiscordSection;
+}
+
+export interface DirectoryEntry {
+	name: string;
+	path: string;
+}
+
+export interface DirectoryBrowseResponse {
+	current_path: string;
+	parent_path: string | null;
+	roots: string[];
+	directories: DirectoryEntry[];
 }
 
 // Partial update types - all fields are optional
@@ -552,6 +570,10 @@ export interface TuningUpdate {
 	branch_max_turns?: number;
 	context_window?: number;
 	history_backfill_count?: number;
+}
+
+export interface WorkspaceUpdate {
+	workspace_allowlist?: string[];
 }
 
 export interface CompactionUpdate {
@@ -597,6 +619,7 @@ export interface AgentConfigUpdateRequest {
 	agent_id: string;
 	routing?: RoutingUpdate;
 	tuning?: TuningUpdate;
+	workspace?: WorkspaceUpdate;
 	compaction?: CompactionUpdate;
 	cortex?: CortexUpdate;
 	coalesce?: CoalesceUpdate;
@@ -1041,6 +1064,11 @@ export const api = {
 
 	agentConfig: (agentId: string) =>
 		fetchJson<AgentConfigResponse>(`/agents/config?agent_id=${encodeURIComponent(agentId)}`),
+	browseConfigDirectories: (agentId: string, path?: string) => {
+		const search = new URLSearchParams({ agent_id: agentId });
+		if (path) search.set("path", path);
+		return fetchJson<DirectoryBrowseResponse>(`/agents/config/directories?${search}`);
+	},
 	updateAgentConfig: async (request: AgentConfigUpdateRequest) => {
 		const response = await fetch(`${API_BASE}/agents/config`, {
 			method: "PUT",

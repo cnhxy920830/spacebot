@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api, type AgentConfigResponse, type AgentConfigUpdateRequest } from "@/api/client";
-import { Button, SettingSidebarButton, Input, TextArea, Toggle, NumberStepper, cx } from "@/ui";
+import { api, type AgentConfigResponse, type AgentConfigUpdateRequest, type DirectoryBrowseResponse } from "@/api/client";
+import { Button, SettingSidebarButton, Input, TextArea, Toggle, NumberStepper, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, cx } from "@/ui";
 import { ModelSelect } from "@/components/ModelSelect";
 import { Markdown } from "@/components/Markdown";
+import { TagInput } from "@/components/TagInput";
 import { motion, AnimatePresence } from "framer-motion";
 import { useSearch, useNavigate } from "@tanstack/react-router";
 
@@ -14,7 +15,7 @@ function supportsAdaptiveThinking(modelId: string): boolean {
 		|| id.includes("sonnet-4-6") || id.includes("sonnet-4.6");
 }
 
-type SectionId = "soul" | "identity" | "user" | "routing" | "tuning" | "compaction" | "cortex" | "coalesce" | "memory" | "browser";
+type SectionId = "soul" | "identity" | "user" | "routing" | "tuning" | "workspace" | "compaction" | "cortex" | "coalesce" | "memory" | "browser";
 
 const SECTIONS: {
 	id: SectionId;
@@ -28,6 +29,7 @@ const SECTIONS: {
 	{ id: "user", label: "User", group: "identity", description: "USER.md", detail: "Information about the human this agent interacts with. Name, preferences, context, and anything that helps the agent personalize responses." },
 	{ id: "routing", label: "Model Routing", group: "config", description: "Which models each process uses", detail: "Controls which LLM model is used for each process type. Channels handle user-facing conversation, branches do thinking, workers execute tasks, the compactor summarizes context, and the cortex observes system state." },
 	{ id: "tuning", label: "Tuning", group: "config", description: "Turn limits, context window, branches", detail: "Core limits that control how much work the agent does per message. Max turns caps LLM iterations per channel message. Context window sets the token budget. Branch limits control parallel thinking." },
+	{ id: "workspace", label: "Workspace Access", group: "config", description: "Tool path allowlist", detail: "Controls which directories worker tools can access through file, shell, and exec operations. The primary workspace is always allowed. Add additional directories to permit cross-project file access." },
 	{ id: "compaction", label: "Compaction", group: "config", description: "Context compaction thresholds", detail: "Thresholds that trigger context summarization as the conversation grows. Background kicks in early, aggressive compresses harder, and emergency truncates without LLM involvement. All values are fractions of the context window." },
 	{ id: "cortex", label: "Cortex", group: "config", description: "System observer settings", detail: "The cortex monitors active processes and generates memory bulletins. Tick interval controls observation frequency. Timeouts determine when stuck workers or branches get cancelled. The circuit breaker auto-disables after consecutive failures." },
 	{ id: "coalesce", label: "Coalesce", group: "config", description: "Message batching", detail: "When multiple messages arrive in quick succession, coalescing batches them into a single LLM turn. This prevents the agent from responding to each message individually in fast-moving conversations." },
@@ -62,7 +64,7 @@ export function AgentConfig({ agentId }: AgentConfigProps) {
 	// Sync activeSection with URL search param
 	useEffect(() => {
 		if (search.tab) {
-			const validSections: SectionId[] = ["soul", "identity", "user", "routing", "tuning", "compaction", "cortex", "coalesce", "memory", "browser"];
+			const validSections: SectionId[] = ["soul", "identity", "user", "routing", "tuning", "workspace", "compaction", "cortex", "coalesce", "memory", "browser"];
 			if (validSections.includes(search.tab as SectionId)) {
 				setActiveSection(search.tab as SectionId);
 			}
@@ -211,6 +213,7 @@ export function AgentConfig({ agentId }: AgentConfigProps) {
 				/>
 				) : (
 					<ConfigSectionEditor
+						agentId={agentId}
 						sectionId={active.id}
 						label={active.label}
 						description={active.description}
@@ -374,6 +377,7 @@ function IdentityEditor({ label, description, content, onDirtyChange, saveHandle
 // -- Config Section Editors --
 
 interface ConfigSectionEditorProps {
+	agentId: string;
 	sectionId: SectionId;
 	label: string;
 	description: string;
@@ -384,14 +388,16 @@ interface ConfigSectionEditorProps {
 	onSave: (update: Partial<AgentConfigUpdateRequest>) => void;
 }
 
-function ConfigSectionEditor({ sectionId, label, description, detail, config, onDirtyChange, saveHandlerRef, onSave }: ConfigSectionEditorProps) {
-	const [localValues, setLocalValues] = useState<Record<string, string | number | boolean>>(() => {
+function ConfigSectionEditor({ agentId, sectionId, label, description, detail, config, onDirtyChange, saveHandlerRef, onSave }: ConfigSectionEditorProps) {
+	const [localValues, setLocalValues] = useState<Record<string, string | number | boolean | string[]>>(() => {
 		// Initialize from config based on section
 		switch (sectionId) {
 			case "routing":
 				return { ...config.routing };
 			case "tuning":
 				return { ...config.tuning };
+			case "workspace":
+				return { workspace_allowlist: [...config.workspace.workspace_allowlist] };
 			case "compaction":
 				return { ...config.compaction };
 			case "cortex":
@@ -408,6 +414,34 @@ function ConfigSectionEditor({ sectionId, label, description, detail, config, on
 	});
 
 	const [localDirty, setLocalDirty] = useState(false);
+	const [isDirectoryPickerOpen, setIsDirectoryPickerOpen] = useState(false);
+	const [browsePath, setBrowsePath] = useState<string | undefined>(undefined);
+	const [selectedDirectory, setSelectedDirectory] = useState<string | null>(null);
+
+	const directoryQuery = useQuery<DirectoryBrowseResponse>({
+		queryKey: ["workspace-directory-browser", agentId, browsePath],
+		queryFn: () => api.browseConfigDirectories(agentId, browsePath),
+		enabled: sectionId === "workspace" && isDirectoryPickerOpen,
+		staleTime: 30_000,
+	});
+
+	const openDirectoryPicker = useCallback(() => {
+		setBrowsePath(undefined);
+		setSelectedDirectory(null);
+		setIsDirectoryPickerOpen(true);
+	}, []);
+
+	const navigateDirectory = useCallback((nextPath: string) => {
+		setBrowsePath(nextPath);
+	}, []);
+
+	useEffect(() => {
+		if (!isDirectoryPickerOpen || !directoryQuery.data) {
+			return;
+		}
+
+		setSelectedDirectory(directoryQuery.data.current_path);
+	}, [isDirectoryPickerOpen, directoryQuery.data]);
 
 	useEffect(() => {
 		onDirtyChange(localDirty);
@@ -422,6 +456,9 @@ function ConfigSectionEditor({ sectionId, label, description, detail, config, on
 					break;
 				case "tuning":
 					setLocalValues({ ...config.tuning });
+					break;
+				case "workspace":
+					setLocalValues({ workspace_allowlist: [...config.workspace.workspace_allowlist] });
 					break;
 				case "compaction":
 					setLocalValues({ ...config.compaction });
@@ -442,13 +479,55 @@ function ConfigSectionEditor({ sectionId, label, description, detail, config, on
 		}
 	}, [config, sectionId, localDirty]);
 
-	const handleChange = useCallback((field: string, value: string | number | boolean) => {
+	const handleChange = useCallback((field: string, value: string | number | boolean | string[]) => {
 		setLocalValues((prev) => ({ ...prev, [field]: value }));
 		setLocalDirty(true);
 	}, []);
 
+	const addSelectedDirectoryToAllowlist = useCallback(() => {
+		if (!selectedDirectory) {
+			return;
+		}
+
+		const currentAllowlist = (localValues.workspace_allowlist as string[] | undefined) ?? [];
+		if (currentAllowlist.includes(selectedDirectory)) {
+			setIsDirectoryPickerOpen(false);
+			return;
+		}
+
+		handleChange("workspace_allowlist", [...currentAllowlist, selectedDirectory]);
+		setIsDirectoryPickerOpen(false);
+	}, [handleChange, localValues.workspace_allowlist, selectedDirectory]);
+
 	const handleSave = useCallback(() => {
-		onSave({ [sectionId]: localValues });
+		switch (sectionId) {
+			case "routing":
+				onSave({ routing: localValues });
+				break;
+			case "tuning":
+				onSave({ tuning: localValues });
+				break;
+			case "workspace": {
+				const workspace_allowlist = (localValues.workspace_allowlist as string[] | undefined) ?? [];
+				onSave({ workspace: { workspace_allowlist } });
+				break;
+			}
+			case "compaction":
+				onSave({ compaction: localValues });
+				break;
+			case "cortex":
+				onSave({ cortex: localValues });
+				break;
+			case "coalesce":
+				onSave({ coalesce: localValues });
+				break;
+			case "memory":
+				onSave({ memory_persistence: localValues });
+				break;
+			case "browser":
+				onSave({ browser: localValues });
+				break;
+		}
 		setLocalDirty(false);
 	}, [onSave, sectionId, localValues]);
 
@@ -459,6 +538,9 @@ function ConfigSectionEditor({ sectionId, label, description, detail, config, on
 				break;
 			case "tuning":
 				setLocalValues({ ...config.tuning });
+				break;
+			case "workspace":
+				setLocalValues({ workspace_allowlist: [...config.workspace.workspace_allowlist] });
 				break;
 			case "compaction":
 				setLocalValues({ ...config.compaction });
@@ -591,6 +673,146 @@ function ConfigSectionEditor({ sectionId, label, description, detail, config, on
 							max={500}
 							suffix=" messages"
 						/>
+					</div>
+				);
+			case "workspace":
+				return (
+					<div className="grid gap-4">
+						<div className="flex flex-col gap-1.5">
+							<label className="text-sm font-medium text-ink">Primary Workspace</label>
+							<p className="text-tiny text-ink-faint">
+								This path is always allowed and used as the default working directory.
+							</p>
+							<Input
+								type="text"
+								value={config.workspace.workspace}
+								readOnly
+								className="mt-1 border-app-line/50 bg-app-darkBox/30 text-ink-faint"
+							/>
+						</div>
+						<div className="flex flex-col gap-1.5">
+							<label className="text-sm font-medium text-ink">Additional Allowed Directories</label>
+							<p className="text-tiny text-ink-faint">
+								Add directories worker tools may access. Use absolute paths for predictable behavior.
+							</p>
+							<TagInput
+								value={(localValues.workspace_allowlist as string[] | undefined) ?? []}
+								onChange={(value) => handleChange("workspace_allowlist", value)}
+								placeholder="D:\\autoAiProject\\autocreatenovel"
+							/>
+						</div>
+						<div className="flex items-center gap-2">
+							<Button
+								type="button"
+								variant="outline"
+								size="sm"
+								onClick={openDirectoryPicker}
+							>
+								Browse Directories
+							</Button>
+							<span className="text-tiny text-ink-faint">
+								Select from filesystem tree instead of typing paths manually.
+							</span>
+						</div>
+
+						<Dialog open={isDirectoryPickerOpen} onOpenChange={setIsDirectoryPickerOpen}>
+							<DialogContent className="max-w-2xl">
+								<DialogHeader>
+									<DialogTitle>Choose Directory</DialogTitle>
+									<DialogDescription>
+										Select a folder and add it to this agent&apos;s workspace allowlist.
+									</DialogDescription>
+								</DialogHeader>
+
+								<div className="grid gap-3">
+									<div className="rounded-md border border-app-line/50 bg-app-darkBox/30 px-3 py-2">
+										<div className="text-tiny text-ink-faint">Current path</div>
+										<div className="truncate text-sm text-ink">
+											{directoryQuery.data?.current_path ?? "Loading..."}
+										</div>
+									</div>
+
+									<div className="flex flex-wrap items-center gap-2">
+										<Button
+											type="button"
+											variant="outline"
+											size="sm"
+											onClick={() => {
+												if (directoryQuery.data?.parent_path) {
+													navigateDirectory(directoryQuery.data.parent_path);
+												}
+											}}
+											disabled={!directoryQuery.data?.parent_path}
+										>
+											Up
+										</Button>
+										{directoryQuery.data?.roots.map((root) => (
+											<Button
+												key={root}
+												type="button"
+												variant="ghost"
+												size="sm"
+												onClick={() => navigateDirectory(root)}
+											>
+												{root}
+											</Button>
+										))}
+									</div>
+
+									<div className="max-h-72 overflow-y-auto rounded-md border border-app-line/50 bg-app-darkBox/20 p-2">
+										{directoryQuery.isLoading ? (
+											<div className="px-2 py-8 text-center text-sm text-ink-faint">Loading directories...</div>
+										) : directoryQuery.isError ? (
+											<div className="px-2 py-8 text-center text-sm text-red-400">Failed to load directories.</div>
+										) : directoryQuery.data?.directories.length ? (
+											directoryQuery.data.directories.map((directory) => {
+												const isSelected = selectedDirectory === directory.path;
+												return (
+													<div key={directory.path} className="mb-2 flex items-center gap-2 last:mb-0">
+														<button
+															type="button"
+															onClick={() => setSelectedDirectory(directory.path)}
+															className={cx(
+																"flex-1 rounded-md border px-3 py-2 text-left transition-colors",
+																isSelected
+																	? "border-accent/50 bg-accent/10"
+																	: "border-app-line/40 bg-app-darkBox/30 hover:border-app-line"
+															)}
+														>
+															<div className="truncate text-sm text-ink">{directory.name}</div>
+															<div className="truncate text-tiny text-ink-faint">{directory.path}</div>
+														</button>
+														<Button
+															type="button"
+															variant="ghost"
+															size="sm"
+															onClick={() => navigateDirectory(directory.path)}
+														>
+															Open
+														</Button>
+													</div>
+												);
+											})
+										) : (
+											<div className="px-2 py-8 text-center text-sm text-ink-faint">No subdirectories found.</div>
+										)}
+									</div>
+								</div>
+
+								<DialogFooter className="gap-2">
+									<Button type="button" variant="ghost" onClick={() => setIsDirectoryPickerOpen(false)}>
+										Cancel
+									</Button>
+									<Button
+										type="button"
+										onClick={addSelectedDirectoryToAllowlist}
+										disabled={!selectedDirectory}
+									>
+										Add Selected Directory
+									</Button>
+								</DialogFooter>
+							</DialogContent>
+						</Dialog>
 					</div>
 				);
 			case "compaction":

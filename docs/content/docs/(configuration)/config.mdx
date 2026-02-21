@@ -108,6 +108,7 @@ screenshot_dir = "/path/to/screenshots" # optional, defaults to data_dir/screens
 id = "main"
 default = true
 workspace = "/custom/workspace/path"   # optional, defaults to ~/.spacebot/agents/{id}/workspace
+workspace_allowlist = ["/extra/project/path", "/mnt/shared-data"] # optional additional roots for worker file/shell/exec access
 
 # Per-agent routing overrides (merges with defaults).
 [agents.routing]

@@ -10,12 +10,20 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct FileTool {
     workspace: PathBuf,
+    allowed_roots: Vec<PathBuf>,
 }
 
 impl FileTool {
     /// Create a new file tool restricted to the given workspace directory.
-    pub fn new(workspace: PathBuf) -> Self {
-        Self { workspace }
+    pub fn new(workspace: PathBuf, mut allowed_roots: Vec<PathBuf>) -> Self {
+        if !allowed_roots.iter().any(|root| root == &workspace) {
+            allowed_roots.push(workspace.clone());
+        }
+
+        Self {
+            workspace,
+            allowed_roots,
+        }
     }
 
     /// Resolve and validate a path, ensuring it stays within the workspace boundary.
@@ -35,19 +43,25 @@ impl FileTool {
         // existing ancestor and append the remaining components.
         let canonical = best_effort_canonicalize(&resolved);
 
-        let workspace_canonical = self
-            .workspace
-            .canonicalize()
-            .unwrap_or_else(|_| self.workspace.clone());
+        let is_allowed = self.allowed_roots.iter().any(|root| {
+            let root_canonical = best_effort_canonicalize(root);
+            canonical.starts_with(&root_canonical)
+        });
 
-        if !canonical.starts_with(&workspace_canonical) {
+        if !is_allowed {
+            let allowlist = self
+                .allowed_roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(FileError(format!(
                 "ACCESS DENIED: Path is outside the workspace boundary. \
-                 File operations are restricted to {}. \
+                 File operations are restricted to configured allowlist roots: {}. \
                  You do not have access to this file and must not attempt to reproduce, \
                  guess, or fabricate its contents. Inform the user that the path is \
                  outside your workspace.",
-                self.workspace.display()
+                allowlist
             )));
         }
 

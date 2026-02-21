@@ -4,7 +4,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
 
@@ -14,28 +14,41 @@ use tokio::process::Command;
 pub struct ExecTool {
     instance_dir: PathBuf,
     workspace: PathBuf,
+    allowed_roots: Vec<PathBuf>,
 }
 
 impl ExecTool {
     /// Create a new exec tool with the given instance directory for path blocking.
-    pub fn new(instance_dir: PathBuf, workspace: PathBuf) -> Self {
+    pub fn new(instance_dir: PathBuf, workspace: PathBuf, mut allowed_roots: Vec<PathBuf>) -> Self {
+        if !allowed_roots.iter().any(|root| root == &workspace) {
+            allowed_roots.push(workspace.clone());
+        }
+
         Self {
             instance_dir,
             workspace,
+            allowed_roots,
         }
+    }
+
+    fn args_mention_allowed_root(&self, all_args: &str) -> bool {
+        self.allowed_roots.iter().any(|root| {
+            let root_text = root.to_string_lossy();
+            all_args.contains(root_text.as_ref())
+        })
     }
 
     /// Check if program arguments reference sensitive instance paths.
     fn check_args(&self, program: &str, args: &[String]) -> Result<(), ExecError> {
         let instance_str = self.instance_dir.to_string_lossy();
-        let workspace_str = self.workspace.to_string_lossy();
         let all_args = std::iter::once(program.to_string())
             .chain(args.iter().cloned())
             .collect::<Vec<_>>()
             .join(" ");
+        let mentions_allowed_root = self.args_mention_allowed_root(&all_args);
 
         // Block references to instance dir (unless targeting workspace within it)
-        if all_args.contains(instance_str.as_ref()) && !all_args.contains(workspace_str.as_ref()) {
+        if all_args.contains(instance_str.as_ref()) && !mentions_allowed_root {
             return Err(ExecError {
                 message: "Cannot access the instance directory — it contains protected configuration and data.".to_string(),
                 exit_code: -1,
@@ -45,8 +58,8 @@ impl ExecTool {
         // Block references to sensitive files by name
         for file in super::shell::SENSITIVE_FILES {
             if all_args.contains(file) {
-                if all_args.contains(instance_str.as_ref())
-                    || !all_args.contains(workspace_str.as_ref())
+                if (all_args.contains(instance_str.as_ref()) && !mentions_allowed_root)
+                    || !mentions_allowed_root
                 {
                     return Err(ExecError {
                         message: format!(
@@ -185,15 +198,16 @@ impl Tool for ExecTool {
         if let Some(ref dir) = args.working_dir {
             let path = std::path::Path::new(dir);
             let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            let workspace_canonical = self
-                .workspace
-                .canonicalize()
-                .unwrap_or_else(|_| self.workspace.clone());
-            if !canonical.starts_with(&workspace_canonical) {
+            if !is_within_allowed_roots(&canonical, &self.allowed_roots) {
+                let allowlist = self
+                    .allowed_roots
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 return Err(ExecError {
                     message: format!(
-                        "working_dir must be within the workspace ({}).",
-                        self.workspace.display()
+                        "working_dir must be within an allowed directory ({allowlist})."
                     ),
                     exit_code: -1,
                 });
@@ -292,6 +306,13 @@ fn format_exec_output(exit_code: i32, stdout: &str, stderr: &str) -> String {
     }
 
     output
+}
+
+fn is_within_allowed_roots(path: &Path, allowed_roots: &[PathBuf]) -> bool {
+    allowed_roots.iter().any(|root| {
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        path.starts_with(&canonical_root)
+    })
 }
 
 /// System-internal exec that bypasses path restrictions.

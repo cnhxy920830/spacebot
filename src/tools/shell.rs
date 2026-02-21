@@ -4,7 +4,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
 
@@ -35,15 +35,28 @@ pub const SECRET_ENV_VARS: &[&str] = &[
 pub struct ShellTool {
     instance_dir: PathBuf,
     workspace: PathBuf,
+    allowed_roots: Vec<PathBuf>,
 }
 
 impl ShellTool {
     /// Create a new shell tool with the given instance directory for path blocking.
-    pub fn new(instance_dir: PathBuf, workspace: PathBuf) -> Self {
+    pub fn new(instance_dir: PathBuf, workspace: PathBuf, mut allowed_roots: Vec<PathBuf>) -> Self {
+        if !allowed_roots.iter().any(|root| root == &workspace) {
+            allowed_roots.push(workspace.clone());
+        }
+
         Self {
             instance_dir,
             workspace,
+            allowed_roots,
         }
+    }
+
+    fn command_mentions_allowed_root(&self, command: &str) -> bool {
+        self.allowed_roots.iter().any(|root| {
+            let root_text = root.to_string_lossy();
+            command.contains(root_text.as_ref())
+        })
     }
 
     /// Check if a command references sensitive instance paths or secret env vars.
@@ -53,11 +66,9 @@ impl ShellTool {
         // Block any command that directly references the instance directory.
         // This prevents listing, reading, traversing, or archiving the instance
         // dir and its contents (config.toml, databases, agent data, etc).
-        // Commands that reference the workspace (which is inside the instance dir)
-        // are allowed through.
+        // Commands that reference configured allowlist directories are allowed through.
         if command.contains(instance_str.as_ref()) {
-            let workspace_str = self.workspace.to_string_lossy();
-            if !command.contains(workspace_str.as_ref()) {
+            if !self.command_mentions_allowed_root(command) {
                 return Err(ShellError {
                     message: "ACCESS DENIED: Cannot access the instance directory — it contains \
                               protected configuration and data. Do not attempt to reproduce or \
@@ -72,12 +83,22 @@ impl ShellTool {
         // (e.g. "cat config.toml" from a relative path, or via variable expansion)
         for file in SENSITIVE_FILES {
             if command.contains(file) {
-                let workspace_str = self.workspace.to_string_lossy();
-                let mentions_workspace = command.contains(workspace_str.as_ref());
+                let mentions_allowed_root = self.command_mentions_allowed_root(command);
                 let mentions_instance = command.contains(instance_str.as_ref());
 
-                // Block if referencing instance dir, or if not clearly targeting workspace
-                if mentions_instance || !mentions_workspace {
+                // Block if referencing instance dir outside allowlist, or if not clearly
+                // targeting any allowlisted directory.
+                if mentions_instance && !mentions_allowed_root {
+                    return Err(ShellError {
+                        message: format!(
+                            "ACCESS DENIED: Cannot access {file} — instance configuration is protected. \
+                             Do not attempt to reproduce or guess the file contents."
+                        ),
+                        exit_code: -1,
+                    });
+                }
+
+                if !mentions_allowed_root {
                     return Err(ShellError {
                         message: format!(
                             "ACCESS DENIED: Cannot access {file} — instance configuration is protected. \
@@ -222,15 +243,16 @@ impl Tool for ShellTool {
         if let Some(ref dir) = args.working_dir {
             let path = std::path::Path::new(dir);
             let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            let workspace_canonical = self
-                .workspace
-                .canonicalize()
-                .unwrap_or_else(|_| self.workspace.clone());
-            if !canonical.starts_with(&workspace_canonical) {
+            if !is_within_allowed_roots(&canonical, &self.allowed_roots) {
+                let allowlist = self
+                    .allowed_roots
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 return Err(ShellError {
                     message: format!(
-                        "working_dir must be within the workspace ({}).",
-                        self.workspace.display()
+                        "working_dir must be within an allowed directory ({allowlist})."
                     ),
                     exit_code: -1,
                 });
@@ -321,6 +343,13 @@ fn format_shell_output(exit_code: i32, stdout: &str, stderr: &str) -> String {
     }
 
     output
+}
+
+fn is_within_allowed_roots(path: &Path, allowed_roots: &[PathBuf]) -> bool {
+    allowed_roots.iter().any(|root| {
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        path.starts_with(&canonical_root)
+    })
 }
 
 /// System-internal shell execution that bypasses path restrictions.

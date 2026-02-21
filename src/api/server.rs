@@ -75,6 +75,10 @@ pub async fn start_http_server(
             get(config::get_agent_config).put(config::update_agent_config),
         )
         .route(
+            "/agents/config/directories",
+            get(config::browse_directories),
+        )
+        .route(
             "/agents/cron",
             get(cron::list_cron_jobs)
                 .post(cron::create_or_update_cron)

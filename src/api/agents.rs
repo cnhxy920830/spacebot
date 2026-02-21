@@ -221,6 +221,7 @@ pub(super) async fn create_agent(
         id: agent_id.clone(),
         default: false,
         workspace: None,
+        workspace_allowlist: None,
         routing: None,
         max_concurrent_branches: None,
         max_concurrent_workers: None,
@@ -403,6 +404,7 @@ pub(super) async fn create_agent(
         agent_config.screenshot_dir(),
         brave_search_key,
         runtime_config.workspace_dir.clone(),
+        runtime_config.workspace_allowlist.load().as_ref().clone(),
         runtime_config.instance_dir.clone(),
     );
     let cortex_store = crate::agent::cortex_chat::CortexChatStore::new(db.sqlite.clone());
