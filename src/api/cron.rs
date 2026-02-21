@@ -38,6 +38,10 @@ pub(super) struct CreateCronRequest {
     active_end_hour: Option<u8>,
     #[serde(default = "default_enabled")]
     enabled: bool,
+    #[serde(default)]
+    run_once: bool,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
 }
 
 fn default_interval() -> u64 {
@@ -74,7 +78,9 @@ struct CronJobWithStats {
     interval_secs: u64,
     delivery_target: String,
     enabled: bool,
+    run_once: bool,
     active_hours: Option<(u8, u8)>,
+    timeout_secs: Option<u64>,
     success_count: u64,
     failure_count: u64,
     last_executed_at: Option<String>,
@@ -122,7 +128,9 @@ pub(super) async fn list_cron_jobs(
             interval_secs: config.interval_secs,
             delivery_target: config.delivery_target,
             enabled: config.enabled,
+            run_once: config.run_once,
             active_hours: config.active_hours,
+            timeout_secs: config.timeout_secs,
             success_count: stats.success_count,
             failure_count: stats.failure_count,
             last_executed_at: stats.last_executed_at,
@@ -186,6 +194,8 @@ pub(super) async fn create_or_update_cron(
         delivery_target: request.delivery_target,
         active_hours,
         enabled: request.enabled,
+        run_once: request.run_once,
+        timeout_secs: request.timeout_secs,
     };
 
     store.save(&config).await.map_err(|error| {

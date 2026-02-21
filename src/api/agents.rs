@@ -11,6 +11,18 @@ use sqlx::Row as _;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+fn hosted_agent_limit() -> Option<usize> {
+    let deployment = std::env::var("SPACEBOT_DEPLOYMENT").ok()?;
+    if !deployment.eq_ignore_ascii_case("hosted") {
+        return None;
+    }
+
+    std::env::var("SPACEBOT_MAX_AGENTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
 #[derive(Serialize)]
 pub(super) struct AgentsResponse {
     agents: Vec<AgentInfo>,
@@ -57,7 +69,9 @@ struct CronJobInfo {
     interval_secs: u64,
     delivery_target: String,
     enabled: bool,
+    run_once: bool,
     active_hours: Option<(u8, u8)>,
+    timeout_secs: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -133,6 +147,16 @@ pub(super) async fn create_agent(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<CreateAgentRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    if let Some(limit) = hosted_agent_limit() {
+        let existing = state.agent_configs.load();
+        if existing.len() >= limit {
+            return Ok(Json(serde_json::json!({
+                "success": false,
+                "message": format!("agent limit reached for this instance: up to {limit} agent{}", if limit == 1 { "" } else { "s" })
+            })));
+        }
+    }
+
     let agent_id = request.agent_id.trim().to_string();
     if agent_id.is_empty() {
         return Ok(Json(serde_json::json!({
@@ -389,19 +413,10 @@ pub(super) async fn create_agent(
     );
 
     let cortex_logger = crate::agent::cortex::CortexLogger::new(db.sqlite.clone());
-    tokio::spawn({
-        let deps = deps.clone();
-        let logger = cortex_logger.clone();
-        async move {
-            crate::agent::cortex::spawn_bulletin_loop(deps, logger).await;
-        }
-    });
-    tokio::spawn({
-        let deps = deps.clone();
-        async move {
-            crate::agent::cortex::spawn_association_loop(deps, cortex_logger).await;
-        }
-    });
+    let _bulletin_loop =
+        crate::agent::cortex::spawn_bulletin_loop(deps.clone(), cortex_logger.clone());
+    let _association_loop =
+        crate::agent::cortex::spawn_association_loop(deps.clone(), cortex_logger);
 
     let ingestion_config = **runtime_config.ingestion.load();
     if ingestion_config.enabled {
@@ -636,7 +651,7 @@ pub(super) async fn agent_overview(
     let channel_count = channels.len();
 
     let cron_rows = sqlx::query(
-        "SELECT id, prompt, interval_secs, delivery_target, active_start_hour, active_end_hour, enabled FROM cron_jobs ORDER BY created_at ASC",
+        "SELECT id, prompt, interval_secs, delivery_target, active_start_hour, active_end_hour, enabled, run_once, timeout_secs FROM cron_jobs ORDER BY created_at ASC",
     )
     .fetch_all(pool)
     .await
@@ -653,10 +668,16 @@ pub(super) async fn agent_overview(
                 interval_secs: row.get::<i64, _>("interval_secs") as u64,
                 delivery_target: row.get("delivery_target"),
                 enabled: row.get::<i64, _>("enabled") != 0,
+                run_once: row.get::<i64, _>("run_once") != 0,
                 active_hours: match (active_start, active_end) {
                     (Some(s), Some(e)) => Some((s as u8, e as u8)),
                     _ => None,
                 },
+                timeout_secs: row
+                    .try_get::<Option<i64>, _>("timeout_secs")
+                    .ok()
+                    .flatten()
+                    .map(|t| t as u64),
             }
         })
         .collect();
